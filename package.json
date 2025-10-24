@@ -9,9 +9,17 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "A real-time multiplayer Texas Hold’em poker game running on a local network. Built with **Node.js, Express, WebSocket, and React**, featuring an admin panel, rotating blinds, and realistic betting mechanics. Designed for **modern minimalist UI** (black and gold).",
   "dependencies": {
     "express": "^5.1.0",
     "ws": "^8.18.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Orion-jada/poker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Orion-jada/poker/issues"
+  },
+  "homepage": "https://github.com/Orion-jada/poker#readme"
 }

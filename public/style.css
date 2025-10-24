@@ -50,3 +50,4 @@ html,body,#root{height:100%;margin:0;background:var(--bg);color:var(--muted)}
 .badge{background:rgba(0,0,0,0.4);padding:6px 8px;border-radius:999px;border:1px solid rgba(255,255,255,0.03)}
 .controls-row{display:flex;gap:8px;align-items:center}
 .turn-indicator{padding:6px 8px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:13px}
+.player .role {font-size: 0.8rem;color: var(--gold);opacity: 0.85;margin-left: 4px;}

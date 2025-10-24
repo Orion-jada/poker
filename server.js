@@ -7,8 +7,8 @@ const path = require('path');
 const ADMIN_PASS = process.env.ADMIN_PASS || 'adminpass';
 const PORT = process.env.PORT || 3000;
 
-const SB = parseInt(process.env.SMALL_BLIND || '10', 10);
-const BB = parseInt(process.env.BIG_BLIND || '20', 10);
+const SB = parseInt(process.env.SMALL_BLIND || '25', 10);
+const BB = parseInt(process.env.BIG_BLIND || '50', 10);
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -29,6 +29,8 @@ let currentBet = 0; // amount to call
 let roundId = 0;
 let bettingRoundStarted = false;
 let lastAggressorIndex = null; // index of last player to raise / bet
+let checkCounter = 0;      // increments on checks/calls; reset on bet/raise/allin
+let requiredChecks = 0;    // number of active players required to "check" to close the round
 
 /* Utilities */
 function makeDeck() {
@@ -56,22 +58,43 @@ function sendTo(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 function publicPlayerInfo() {
-  return players.map((p, idx) => ({
-    id: p.id,
-    name: p.name,
-    chips: p.chips,
-    folded: p.folded,
-    seat: p.seat,
-    currentBet: p.currentBet || 0,
-    active: p.active !== false
-  }));
+  // Determine SB and BB relative to dealer
+  const sbIndex = nextActiveIndex(dealerIndex);
+  const bbIndex = nextActiveIndex(sbIndex);
+
+  return players.map((p, idx) => {
+    let role = '';
+
+    if (idx === dealerIndex) role = 'Dealer';
+    else if (idx === sbIndex) role = 'Small Blind';
+    else if (idx === bbIndex) role = 'Big Blind';
+    else {
+      // Figure out if they’re UTG or other position
+      // UTG = next active after BB
+      const utgIndex = nextActiveIndex(bbIndex);
+      if (idx === utgIndex) role = 'UTG';
+      else role = 'Player';
+    }
+
+    return {
+      id: p.id,
+      name: p.name,
+      chips: p.chips,
+      folded: p.folded,
+      seat: p.seat,
+      currentBet: p.currentBet || 0,
+      active: p.active !== false,
+      role
+    };
+  });
 }
 function resetPlayerRoundState() {
-  players.forEach(p => {
+  players.forEach((p, idx) => {
     p.hole = [];
     p.folded = false;
     p.currentBet = 0;
     p.active = p.chips > 0;
+    p.seat = idx + 1; // seats are 1-based
   });
 }
 function compactPlayers() {
@@ -105,9 +128,11 @@ function dealHoleCards() {
   }
 }
 function startNewRound() {
-// dealer rotation is handled at end of previous round
   if (players.length === 0) return;
-// do not override dealerIndex here
+
+  // rotate dealer forward one seat (dealer rotates each new round)
+  dealerIndex = (dealerIndex + 1) % players.length;
+
   resetPlayerRoundState();
   deck = makeDeck();
   shuffle(deck);
@@ -119,8 +144,10 @@ function startNewRound() {
   roundId++;
   bettingRoundStarted = false;
   lastAggressorIndex = null;
+  checkCounter = 0;
+  requiredChecks = 0;
 
-  // ensure at least two active players
+  // ensure at least two active players with chips
   const activeCount = players.filter(p => p.chips > 0).length;
   if (activeCount < 2) {
     broadcast({ type: 'error', message: 'Need at least 2 players with chips to start round' });
@@ -129,29 +156,30 @@ function startNewRound() {
     return;
   }
 
-  // randomly ensure dealerIndex is valid (clamp)
-  if (dealerIndex >= players.length) dealerIndex = 0;
-
   // deal hole cards
   dealHoleCards();
 
-  // post blinds: small blind = player after dealer, big blind next
-  // find next active players for blinds
+  // find small blind and big blind (next active players after dealer)
   const sbIndex = nextActiveIndex(dealerIndex);
   const bbIndex = nextActiveIndex(sbIndex);
 
   // reset bets
   players.forEach(p => p.currentBet = 0);
 
+  // post blinds
   postBlind(sbIndex, SB);
   postBlind(bbIndex, BB);
 
-  // set current bet to BB
-  currentBet = BB;
-  // preflop action starts on player after BB
+  currentBet = Math.max(SB, BB, players[bbIndex].currentBet); // ensure currentBet reflects BB (or larger if BB was all-in)
+  // action starts on player after big blind (UTG)
   turnIndex = nextActiveIndex(bbIndex);
+
+  // Setup check-counter semantics for phase closing: only count active players (not folded, not all-in)
+  requiredChecks = players.filter(p => !p.folded && (p.chips > 0 || p.currentBet > 0)).length;
+  checkCounter = 0;
+
   bettingRoundStarted = true;
-  // BB is considered last aggressor for preflop
+  // consider BB as last aggressor for preflop to prevent immediate closure unless everyone else acts
   lastAggressorIndex = bbIndex;
 
   broadcastState();
@@ -192,9 +220,7 @@ function allButOneFolded() {
 }
 
 function advancePhase() {
-  // proceed flop, turn, river, showdown
   if (phase === 'preflop') {
-    // burn + 3
     deck.pop(); // burn
     community.push(deck.pop(), deck.pop(), deck.pop());
     phase = 'flop';
@@ -211,11 +237,17 @@ function advancePhase() {
     performShowdown();
     return;
   }
-  // reset betting for new phase
+
+  // reset per-phase betting trackers
   players.forEach(p => p.currentBet = 0);
   currentBet = 0;
+
+  // reset check counting for the new betting round
+  requiredChecks = players.filter(p => !p.folded && (p.chips > 0 || p.currentBet > 0)).length;
+  checkCounter = 0;
   bettingRoundStarted = true;
-  // set turn to first active player after dealer
+
+  // set turn to first active player after dealer (standard: first to act postflop is player left of dealer)
   turnIndex = nextActiveIndex(dealerIndex);
   broadcastState();
 }
@@ -446,14 +478,12 @@ wss.on('connection', (ws) => {
       const msg = JSON.parse(data.toString());
       if (msg.type === 'join') {
         const name = (msg.name || 'Player').slice(0,20);
-        const seat = players.length;
+        const seat = players.length + 1; // seats start at 1
         const player = { id, name, chips: 1000, ws, folded: false, hole: [], seat, currentBet: 0, active: true };
         players.push(player);
         attachedPlayer = player;
         sendTo(ws, { type: 'joined', player: { id: player.id, name: player.name, chips: player.chips, seat } });
         broadcastState();
-        // if a round is in progress, send hole privately if already dealt
-        if (phase !== 'lobby' && player.hole.length === 2) sendTo(ws, { type: 'your_hole', hole: player.hole, roundId });
       }
 
       else if (msg.type === 'admin_auth') {
@@ -510,14 +540,21 @@ wss.on('connection', (ws) => {
         }
 
         const act = msg.action;
+
+        // helper: compute number of currently "active-for-action" players
+        function countActiveForAction() {
+          return players.filter(p => !p.folded && (p.chips > 0 || p.currentBet > 0)).length;
+        }
+
         if (act === 'fold') {
           actor.folded = true;
+          // folded players are not part of requiredChecks
         } else if (act === 'check') {
-          // valid if currentBet == actor.currentBet
           if (actor.currentBet < currentBet) {
             return sendTo(ws, { type: 'error', message: 'Cannot check, must call or fold' });
           }
-          // nothing to do
+          // a check counts toward closing the betting round
+          checkCounter += 1;
         } else if (act === 'call') {
           const toCall = currentBet - actor.currentBet;
           const actual = Math.min(toCall, actor.chips);
@@ -525,6 +562,8 @@ wss.on('connection', (ws) => {
           actor.currentBet += actual;
           pot += actual;
           if (actor.chips === 0) actor.active = false;
+          // calling counts toward the check-counter as a passive action
+          checkCounter += 1;
         } else if (act === 'bet') {
           let amt = Math.max(0, Math.floor(msg.amount || 0));
           if (amt <= currentBet) {
@@ -538,18 +577,27 @@ wss.on('connection', (ws) => {
           actor.currentBet = amt;
           pot += toPut;
           currentBet = amt;
+
+          // Raising/betting resets the check counter because players must respond to the raise
+          checkCounter = 0;
           lastAggressorIndex = pIndex;
         } else if (act === 'allin') {
-          const amt = actor.chips + actor.currentBet;
           const put = actor.chips;
           actor.currentBet += put;
           actor.chips = 0;
           pot += put;
+          // If all-in increases the current bet, it's considered an aggressive action
           if (actor.currentBet > currentBet) {
             currentBet = actor.currentBet;
             lastAggressorIndex = pIndex;
+            checkCounter = 0;
+          } else {
+            // If all-in merely calls, treat it as passive action
+            checkCounter += 1;
           }
           actor.active = false;
+        } else {
+          return sendTo(ws, { type: 'error', message: 'unknown action' });
         }
 
         // advance turn to next active (non-folded) player
@@ -578,11 +626,31 @@ wss.on('connection', (ws) => {
           return;
         }
 
-        // If betting round complete, advance phase automatically
-        if (isBettingRoundComplete()) {
-          // move to next phase
-          advancePhase();
+        // If only one player remains (everyone else folded), award pot immediately
+        if (allButOneFolded()) {
+          const winner = players.find(p => !p.folded);
+          if (winner) {
+            winner.chips += pot;
+            broadcast({ type: 'auto_fold_win', winner: { id: winner.id, name: winner.name }, pot });
+            pot = 0;
+          }
+          phase = 'lobby';
+          dealerIndex = (dealerIndex + 1) % players.length;
+          broadcastState();
+          return;
         }
+
+        // Recompute requiredChecks in case some players folded or went all-in
+        requiredChecks = players.filter(p => !p.folded && (p.chips > 0 || p.currentBet > 0)).length;
+
+        // If checkCounter reaches requiredChecks, that means all active players had passive actions in a row — advance phase.
+        if (requiredChecks > 0 && checkCounter >= requiredChecks) {
+          // clear counter before advancing
+          checkCounter = 0;
+          advancePhase();
+          return;
+        }
+
       }
 
     } catch (e) {

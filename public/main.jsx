@@ -166,19 +166,46 @@ function App(){
                             <div className="center-line"></div>
 
                             <div style={{display:'flex',gap:12,flexWrap:'wrap'}}>
-                                {players.map((p, idx) => (
-                                    <div className="player" key={p.id} style={{minWidth:160, border: idx===turnIndex ? `1px solid ${idx===meIndex ? 'var(--gold)' : 'rgba(255,255,255,0.08)'}` : 'none'}}>
-                                        <div>
-                                            <div className="name">{p.name}{idx===dealerIndex ? ' 🟡' : ''}</div>
-                                            <div className="chips">Chips: {p.chips}</div>
-                                            <div className="small">Bet: {p.currentBet}</div>
+                                {players.map((p, idx) => {
+                                    // Determine role labels
+                                    let role = '';
+                                    if (idx === dealerIndex) role = 'Dealer';
+                                    else if (idx === (dealerIndex + 1) % players.length) role = 'Small Blind';
+                                    else if (idx === (dealerIndex + 2) % players.length) role = 'Big Blind';
+                                    else if (players.length > 3) {
+                                        const utgIndex = (dealerIndex + 3) % players.length;
+                                        if (idx === utgIndex) role = 'UTG';
+                                        else if (idx === (utgIndex + 1) % players.length) role = 'CO';
+                                        else if (idx === (utgIndex + 2) % players.length) role = 'MP';
+                                        else if (idx === (utgIndex + 3) % players.length) role = 'BTN';
+                                    }
+
+                                    return (
+                                        <div
+                                            key={p.id}
+                                            className="player"
+                                            style={{
+                                                minWidth: 160,
+                                                border: idx === turnIndex
+                                                    ? `1px solid ${idx === meIndex ? 'var(--gold)' : 'rgba(255,255,255,0.08)'}`
+                                                    : 'none'
+                                            }}
+                                        >
+                                            <div>
+                                                <div className="name">
+                                                    {p.name}{' '}
+                                                    <span className="role">{role ? `(${role})` : ''}</span>
+                                                </div>
+                                                <div className="chips">Chips: {p.chips}</div>
+                                                <div className="small">Bet: {p.currentBet}</div>
+                                            </div>
+                                            <div style={{ textAlign: 'right' }}>
+                                                <div className="small">{p.folded ? 'Folded' : (idx === turnIndex ? 'Turn' : '')}</div>
+                                                <div className="small">Seat {p.seat}</div>
+                                            </div>
                                         </div>
-                                        <div style={{textAlign:'right'}}>
-                                            <div className="small">{p.folded ? 'Folded' : (idx===turnIndex ? 'Turn' : '')}</div>
-                                            <div className="small">Seat {p.seat}</div>
-                                        </div>
-                                    </div>
-                                ))}
+                                    );
+                                })}
                             </div>
 
                             <div className="me">
