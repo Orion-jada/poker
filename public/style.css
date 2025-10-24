@@ -1,0 +1,52 @@
+/* style.css - minimalist black & gold (updated) */
+:root{
+    --bg:#0b0b0b;
+    --panel:#111;
+    --muted:#bfbfbf;
+    --gold:#d4af37;
+    --glass: rgba(255,255,255,0.03);
+    --accent: linear-gradient(90deg,#d4af37,#ffd57a);
+    font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+}
+*{box-sizing:border-box}
+html,body,#root{height:100%;margin:0;background:var(--bg);color:var(--muted)}
+.app{
+    padding:18px;
+    display:flex;
+    gap:18px;
+    height:100%;
+    align-items:flex-start;
+    justify-content:center;
+}
+.left, .right {
+    background:var(--panel);
+    border-radius:12px;
+    padding:16px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.7);
+}
+.left{width:720px; min-height:520px}
+.right{width:320px; min-height:520px}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.title{font-size:18px;color:var(--gold);font-weight:600}
+.small{font-size:13px;color:#999}
+.lobby, .table, .admin{margin-top:12px}
+.player-list{display:flex;flex-wrap:wrap;gap:8px}
+.player{padding:8px 10px;background:var(--glass);border-radius:10px;min-width:140px;display:flex;justify-content:space-between;align-items:center}
+.player .name{font-weight:600;color:#fff}
+.player .chips{font-size:13px;color:var(--muted)}
+.controls{display:flex;gap:8px;margin-top:12px}
+.btn{
+    background:transparent;border:1px solid rgba(255,255,255,0.06);padding:8px 10px;border-radius:10px;color:var(--muted);cursor:pointer;
+}
+.btn.gold{border-color:var(--gold);color:var(--gold);font-weight:600}
+.btn.small{padding:6px 8px;font-size:13px;border-radius:8px}
+.table-view{background:linear-gradient(180deg,#0d0d0d,#0a0a0a);border-radius:12px;padding:18px;color:#fff;display:flex;flex-direction:column;gap:12px}
+.community{display:flex;gap:8px}
+.card{width:56px;height:80px;border-radius:8px;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;font-weight:700}
+.me{margin-top:12px;padding:10px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:10px}
+.center-line{height:1px;background:rgba(255,255,255,0.03);margin:12px 0}
+.input{width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:var(--muted)}
+.footer{font-size:12px;color:#777;margin-top:10px}
+.badge{background:rgba(0,0,0,0.4);padding:6px 8px;border-radius:999px;border:1px solid rgba(255,255,255,0.03)}
+.controls-row{display:flex;gap:8px;align-items:center}
+.turn-indicator{padding:6px 8px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:13px}

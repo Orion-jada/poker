@@ -1,0 +1,605 @@
+// server.js
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const path = require('path');
+
+const ADMIN_PASS = process.env.ADMIN_PASS || 'adminpass';
+const PORT = process.env.PORT || 3000;
+
+const SB = parseInt(process.env.SMALL_BLIND || '10', 10);
+const BB = parseInt(process.env.BIG_BLIND || '20', 10);
+
+const app = express();
+app.use(express.static(path.join(__dirname, 'public')));
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
+/** Game state **/
+let players = []; // {id, name, chips, ws, folded, hole:[], seat, currentBet, active}
+let pot = 0;
+let sidePots = []; // not fully fleshed but stubbed
+let deck = [];
+let community = [];
+let phase = 'lobby'; // lobby, preflop, flop, turn, river, showdown
+let dealerIndex = 0;
+let turnIndex = 0; // index in players array for whose turn it is
+let currentBet = 0; // amount to call
+let roundId = 0;
+let bettingRoundStarted = false;
+let lastAggressorIndex = null; // index of last player to raise / bet
+
+/* Utilities */
+function makeDeck() {
+  const suits = ['s','h','d','c']; // use letters internally
+  const ranks = ['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
+  const d = [];
+  for (const s of suits) for (const r of ranks) d.push(r + s);
+  return d;
+}
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+}
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  for (const p of players) {
+    if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+      p.ws.send(msg);
+    }
+  }
+}
+function sendTo(ws, obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+function publicPlayerInfo() {
+  return players.map((p, idx) => ({
+    id: p.id,
+    name: p.name,
+    chips: p.chips,
+    folded: p.folded,
+    seat: p.seat,
+    currentBet: p.currentBet || 0,
+    active: p.active !== false
+  }));
+}
+function resetPlayerRoundState() {
+  players.forEach(p => {
+    p.hole = [];
+    p.folded = false;
+    p.currentBet = 0;
+    p.active = p.chips > 0;
+  });
+}
+function compactPlayers() {
+  // remove disconnected players that have no ws
+  players = players.filter(p => !(p.ws === null && p.chips === 0));
+}
+function broadcastState() {
+  broadcast({
+    type: 'state',
+    players: publicPlayerInfo(),
+    pot,
+    community,
+    phase,
+    dealerIndex,
+    turnIndex,
+    currentBet,
+    roundId,
+    SB,
+    BB,
+    bettingRoundStarted
+  });
+}
+
+/* Poker core helpers */
+function dealHoleCards() {
+  for (let i = 0; i < 2; i++) {
+    for (let j = 0; j < players.length; j++) {
+      const p = players[(dealerIndex + 1 + j) % players.length];
+      if (p && p.active) p.hole.push(deck.pop());
+    }
+  }
+}
+function startNewRound() {
+// dealer rotation is handled at end of previous round
+  if (players.length === 0) return;
+// do not override dealerIndex here
+  resetPlayerRoundState();
+  deck = makeDeck();
+  shuffle(deck);
+  community = [];
+  pot = 0;
+  sidePots = [];
+  currentBet = 0;
+  phase = 'preflop';
+  roundId++;
+  bettingRoundStarted = false;
+  lastAggressorIndex = null;
+
+  // ensure at least two active players
+  const activeCount = players.filter(p => p.chips > 0).length;
+  if (activeCount < 2) {
+    broadcast({ type: 'error', message: 'Need at least 2 players with chips to start round' });
+    phase = 'lobby';
+    broadcastState();
+    return;
+  }
+
+  // randomly ensure dealerIndex is valid (clamp)
+  if (dealerIndex >= players.length) dealerIndex = 0;
+
+  // deal hole cards
+  dealHoleCards();
+
+  // post blinds: small blind = player after dealer, big blind next
+  // find next active players for blinds
+  const sbIndex = nextActiveIndex(dealerIndex);
+  const bbIndex = nextActiveIndex(sbIndex);
+
+  // reset bets
+  players.forEach(p => p.currentBet = 0);
+
+  postBlind(sbIndex, SB);
+  postBlind(bbIndex, BB);
+
+  // set current bet to BB
+  currentBet = BB;
+  // preflop action starts on player after BB
+  turnIndex = nextActiveIndex(bbIndex);
+  bettingRoundStarted = true;
+  // BB is considered last aggressor for preflop
+  lastAggressorIndex = bbIndex;
+
+  broadcastState();
+
+  // send private hole cards
+  players.forEach(p => {
+    if (p.hole && p.hole.length === 2) {
+      sendTo(p.ws, { type: 'your_hole', hole: p.hole, roundId });
+    }
+  });
+}
+
+function postBlind(idx, amt) {
+  const p = players[idx];
+  if (!p || !p.active) return;
+  const pay = Math.min(amt, p.chips);
+  p.chips -= pay;
+  p.currentBet = (p.currentBet || 0) + pay;
+  pot += pay;
+  if (p.chips === 0) p.active = false;
+}
+
+function nextActiveIndex(fromIdx) {
+  if (players.length === 0) return 0;
+  let i = (fromIdx + 1) % players.length;
+  for (let tries=0; tries<players.length; tries++) {
+    if (players[i] && players[i].chips > 0) return i;
+    i = (i+1) % players.length;
+  }
+  // fallback
+  return (fromIdx + 1) % players.length;
+}
+
+function allButOneFolded() {
+  const active = players.filter(p => p.chips > 0 || p.currentBet > 0);
+  const stillIn = active.filter(p => !p.folded);
+  return stillIn.length <= 1;
+}
+
+function advancePhase() {
+  // proceed flop, turn, river, showdown
+  if (phase === 'preflop') {
+    // burn + 3
+    deck.pop(); // burn
+    community.push(deck.pop(), deck.pop(), deck.pop());
+    phase = 'flop';
+  } else if (phase === 'flop') {
+    deck.pop();
+    community.push(deck.pop());
+    phase = 'turn';
+  } else if (phase === 'turn') {
+    deck.pop();
+    community.push(deck.pop());
+    phase = 'river';
+  } else if (phase === 'river') {
+    phase = 'showdown';
+    performShowdown();
+    return;
+  }
+  // reset betting for new phase
+  players.forEach(p => p.currentBet = 0);
+  currentBet = 0;
+  bettingRoundStarted = true;
+  // set turn to first active player after dealer
+  turnIndex = nextActiveIndex(dealerIndex);
+  broadcastState();
+}
+
+function isBettingRoundComplete() {
+  const inPlayers = players.filter(p => !p.folded && (p.chips > 0 || p.currentBet > 0));
+  if (inPlayers.length <= 1) return true;
+
+  // If everyone has matched currentBet or is all-in
+  const allMatched = inPlayers.every(p => p.currentBet === currentBet || p.chips === 0);
+  if (!allMatched) return false;
+
+  // Only advance if turnIndex is back to last aggressor
+  if (lastAggressorIndex === null) {
+    // No one bet/raised: check if full loop done
+    return true;
+  } else {
+    return turnIndex === nextActiveIndex(lastAggressorIndex);
+  }
+}
+
+/* Hand evaluation: returns comparable score where higher is better.
+   We'll implement a compact evaluator for: straight flush, quads, full house, flush, straight, trips, two pair, pair, high card.
+   Score format: [rank(8..0), tiebreaker ranks...]
+*/
+function rankToValue(r) {
+  if (r === 'A') return 14;
+  if (r === 'K') return 13;
+  if (r === 'Q') return 12;
+  if (r === 'J') return 11;
+  return parseInt(r, 10);
+}
+function parseCard(card) {
+  // card like 'As' or '10h' etc.
+  const suit = card.slice(-1);
+  const rank = card.slice(0, -1);
+  return { rank, suit, value: rankToValue(rank) };
+}
+function getAllCombos(arr, k) {
+  const res = [];
+  const n = arr.length;
+  function backtrack(start, comb) {
+    if (comb.length === k) {
+      res.push(comb.slice());
+      return;
+    }
+    for (let i = start; i < n; i++) {
+      comb.push(arr[i]);
+      backtrack(i+1, comb);
+      comb.pop();
+    }
+  }
+  backtrack(0, []);
+  return res;
+}
+function evaluate5(cards) {
+  // cards: array of 5 strings
+  const parsed = cards.map(parseCard).sort((a,b)=>b.value - a.value);
+  const values = parsed.map(p => p.value);
+  const suits = parsed.map(p => p.suit);
+
+  const counts = {};
+  for (const v of values) counts[v] = (counts[v]||0) + 1;
+  const countsArr = Object.entries(counts).map(([v,c])=>({v: parseInt(v,10), c})).sort((a,b) => b.c - a.c || b.v - a.v);
+
+  const isFlush = suits.every(s => s === suits[0]);
+
+  // Straight detection (consider wheel A-2-3-4-5)
+  let uniqueVals = [...new Set(values)].sort((a,b)=>b-a);
+  // handle wheel possibility by adding 1 for A as value 1
+  let isStraight = false;
+  let topStraightValue = 0;
+  if (uniqueVals.length >= 5) {
+    for (let i = 0; i <= uniqueVals.length - 5; i++) {
+      const window = uniqueVals.slice(i, i+5);
+      if (window[0] - window[4] === 4) {
+        isStraight = true;
+        topStraightValue = window[0];
+        break;
+      }
+    }
+  }
+  // wheel: A(14),5,4,3,2
+  if (!isStraight) {
+    const hasA = uniqueVals.includes(14);
+    const has5432 = [5,4,3,2].every(v=>uniqueVals.includes(v));
+    if (hasA && has5432) { isStraight = true; topStraightValue = 5; }
+  }
+
+  // Straight flush
+  if (isFlush && isStraight) {
+    return {rank:8, tiebreak: [topStraightValue]};
+  }
+
+  // Four of a kind
+  if (countsArr[0].c === 4) {
+    const four = countsArr[0].v;
+    const kicker = countsArr.find(x=>x.v !== four).v;
+    return {rank:7, tiebreak: [four,kicker]};
+  }
+
+  // Full house
+  if (countsArr[0].c === 3 && countsArr.length >1 && countsArr[1].c >=2) {
+    const triple = countsArr[0].v;
+    const pair = countsArr[1].v;
+    return {rank:6, tiebreak:[triple,pair]};
+  }
+
+  // Flush
+  if (isFlush) {
+    return {rank:5, tiebreak: values};
+  }
+
+  // Straight
+  if (isStraight) {
+    return {rank:4, tiebreak:[topStraightValue]};
+  }
+
+  // Three of a kind
+  if (countsArr[0].c === 3) {
+    const triple = countsArr[0].v;
+    const kickers = countsArr.slice(1).map(x=>x.v).slice(0,2);
+    return {rank:3, tiebreak:[triple,...kickers]};
+  }
+
+  // Two pair
+  if (countsArr[0].c === 2 && countsArr[1] && countsArr[1].c === 2) {
+    const hi = countsArr[0].v;
+    const lo = countsArr[1].v;
+    const kicker = countsArr.slice(2).find(x=>x).v;
+    return {rank:2, tiebreak:[hi,lo,kicker]};
+  }
+
+  // One pair
+  if (countsArr[0].c === 2) {
+    const pair = countsArr[0].v;
+    const kickers = countsArr.slice(1).map(x=>x.v).slice(0,3);
+    return {rank:1, tiebreak:[pair,...kickers]};
+  }
+
+  // High card
+  return {rank:0, tiebreak: values.slice(0,5)};
+}
+function evaluateHand7(cards7) {
+  // cards7: array of 7 card strings
+  const combos = getAllCombos(cards7, 5);
+  let best = null;
+  for (const c of combos) {
+    const eval5 = evaluate5(c);
+    if (!best) { best = eval5; continue; }
+    if (eval5.rank > best.rank) best = eval5;
+    else if (eval5.rank === best.rank) {
+      // compare tiebreakers lexicographically
+      const a = eval5.tiebreak;
+      const b = best.tiebreak;
+      for (let i=0;i<Math.max(a.length,b.length);i++) {
+        const av = a[i] || 0;
+        const bv = b[i] || 0;
+        if (av > bv) { best = eval5; break; }
+        if (av < bv) break;
+      }
+    }
+  }
+  return best;
+}
+
+function performShowdown() {
+  // Determine winners among players who have not folded
+  const contenders = players.filter(p => !p.folded && (p.hole && p.hole.length === 2));
+  const results = contenders.map(p => {
+    const cards7 = [...(p.hole||[]), ...community];
+    const score = evaluateHand7(cards7);
+    return {player: p, score};
+  });
+
+  // find best score
+  let best = null;
+  for (const r of results) {
+    if (!best) { best = r; continue; }
+    if (r.score.rank > best.score.rank) best = r;
+    else if (r.score.rank === best.score.rank) {
+      // compare tiebreakers
+      const a = r.score.tiebreak;
+      const b = best.score.tiebreak;
+      let winner = null;
+      for (let i=0;i<Math.max(a.length,b.length);i++) {
+        const av = a[i] || 0;
+        const bv = b[i] || 0;
+        if (av > bv) { winner = r; break; }
+        if (av < bv) { winner = best; break; }
+      }
+      if (winner === r) best = r;
+    }
+  }
+
+  // bunch of simplistic split-pot handling: if multiple have identical scores, split evenly
+  const winners = results.filter(r => {
+    // compare r.score to best.score
+    if (r.score.rank !== best.score.rank) return false;
+    const a = r.score.tiebreak, b = best.score.tiebreak;
+    if (a.length !== b.length) return false;
+    for (let i=0;i<a.length;i++) if (a[i] !== b[i]) return false;
+    return true;
+  });
+
+  const share = Math.floor(pot / winners.length);
+  winners.forEach(w => w.player.chips += share);
+  // remainder stays in pot for next (but we'll zero pot)
+  pot = 0;
+  phase = 'lobby';
+  // rotate dealer for next round
+  dealerIndex = (dealerIndex + 1) % players.length;
+  broadcast({
+    type: 'showdown_result',
+    winners: winners.map(w => ({ id: w.player.id, name: w.player.name })),
+    community,
+    potShare: share
+  });
+  broadcastState();
+}
+
+wss.on('connection', (ws) => {
+  const id = Math.random().toString(36).slice(2,9);
+  let attachedPlayer = null;
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'join') {
+        const name = (msg.name || 'Player').slice(0,20);
+        const seat = players.length;
+        const player = { id, name, chips: 1000, ws, folded: false, hole: [], seat, currentBet: 0, active: true };
+        players.push(player);
+        attachedPlayer = player;
+        sendTo(ws, { type: 'joined', player: { id: player.id, name: player.name, chips: player.chips, seat } });
+        broadcastState();
+        // if a round is in progress, send hole privately if already dealt
+        if (phase !== 'lobby' && player.hole.length === 2) sendTo(ws, { type: 'your_hole', hole: player.hole, roundId });
+      }
+
+      else if (msg.type === 'admin_auth') {
+        const ok = msg.pass === ADMIN_PASS;
+        sendTo(ws, { type: 'admin_auth_result', ok });
+        if (ok) ws.isAdmin = true;
+      }
+
+      else if (msg.type === 'admin_cmd') {
+        if (!ws.isAdmin) return sendTo(ws, { type: 'error', message: 'not admin' });
+        const cmd = msg.cmd;
+        if (cmd === 'start_round') {
+          // ensure dealerIndex valid
+          if (players.length < 2) return sendTo(ws, { type: 'error', message: 'Need at least 2 players' });
+          startNewRound();
+        } else if (cmd === 'advance') {
+          // admin override to advance
+          advancePhase();
+        } else if (cmd === 'reset_all') {
+          players.forEach(p => { p.chips = 1000; p.hole = []; p.folded = false; p.currentBet = 0; p.active = true; });
+          pot = 0; community = []; phase = 'lobby';
+          broadcastState();
+        } else if (cmd === 'kick') {
+          const pid = msg.playerId;
+          players = players.filter(p => {
+            if (p.id === pid) {
+              if (p.ws && p.ws.readyState === WebSocket.OPEN) sendTo(p.ws, { type: 'kicked' });
+              return false;
+            }
+            return true;
+          });
+          broadcastState();
+        }
+      }
+
+      else if (msg.type === 'action') {
+        // server enforces turns
+        // actions: fold, check, call, bet(amount), allin
+        const pIndex = players.findIndex(x => x.id === id);
+        if (pIndex === -1) return;
+
+        const actor = players[pIndex];
+        if (phase === 'lobby') {
+          return sendTo(ws, { type: 'error', message: 'No active hand' });
+        }
+        if (pIndex !== turnIndex) {
+          return sendTo(ws, { type: 'error', message: 'Not your turn' });
+        }
+        if (actor.folded || actor.chips === 0) {
+          // advance turn automatically
+          turnIndex = nextActiveIndex(turnIndex);
+          broadcastState();
+          return;
+        }
+
+        const act = msg.action;
+        if (act === 'fold') {
+          actor.folded = true;
+        } else if (act === 'check') {
+          // valid if currentBet == actor.currentBet
+          if (actor.currentBet < currentBet) {
+            return sendTo(ws, { type: 'error', message: 'Cannot check, must call or fold' });
+          }
+          // nothing to do
+        } else if (act === 'call') {
+          const toCall = currentBet - actor.currentBet;
+          const actual = Math.min(toCall, actor.chips);
+          actor.chips -= actual;
+          actor.currentBet += actual;
+          pot += actual;
+          if (actor.chips === 0) actor.active = false;
+        } else if (act === 'bet') {
+          let amt = Math.max(0, Math.floor(msg.amount || 0));
+          if (amt <= currentBet) {
+            return sendTo(ws, { type: 'error', message: 'Bet must be greater than current bet (raise)' });
+          }
+          const toPut = amt - actor.currentBet;
+          if (toPut > actor.chips) {
+            return sendTo(ws, { type: 'error', message: 'Not enough chips' });
+          }
+          actor.chips -= toPut;
+          actor.currentBet = amt;
+          pot += toPut;
+          currentBet = amt;
+          lastAggressorIndex = pIndex;
+        } else if (act === 'allin') {
+          const amt = actor.chips + actor.currentBet;
+          const put = actor.chips;
+          actor.currentBet += put;
+          actor.chips = 0;
+          pot += put;
+          if (actor.currentBet > currentBet) {
+            currentBet = actor.currentBet;
+            lastAggressorIndex = pIndex;
+          }
+          actor.active = false;
+        }
+
+        // advance turn to next active (non-folded) player
+        let tries = 0;
+        do {
+          turnIndex = (turnIndex + 1) % players.length;
+          tries++;
+          // if we loop too much, break
+          if (tries > players.length + 5) break;
+        } while ((players[turnIndex].folded || players[turnIndex].chips === 0) && tries < players.length + 5);
+
+        broadcastState();
+
+        // check collapsing conditions: if all but one folded -> award pot
+        if (allButOneFolded()) {
+          // award pot to remaining player
+          const winner = players.find(p => !p.folded);
+          if (winner) {
+            winner.chips += pot;
+            broadcast({ type: 'auto_fold_win', winner: { id: winner.id, name: winner.name }, pot });
+            pot = 0;
+          }
+          phase = 'lobby';
+          dealerIndex = (dealerIndex + 1) % players.length;
+          broadcastState();
+          return;
+        }
+
+        // If betting round complete, advance phase automatically
+        if (isBettingRoundComplete()) {
+          // move to next phase
+          advancePhase();
+        }
+      }
+
+    } catch (e) {
+      console.error('ws parse error', e);
+      sendTo(ws, { type: 'error', message: 'bad message' });
+    }
+  });
+
+  ws.on('close', () => {
+    // detach player's ws but keep player in list (so their chips persist)
+    const p = players.find(p => p.id === id);
+    if (p) p.ws = null;
+    players = players.filter(p => p.id !== id || p.ws !== null); // remove disconnected players
+    broadcastState();
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
+});
