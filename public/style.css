@@ -1,11 +1,12 @@
 /* style.css - minimalist black & gold (updated) */
-:root{
-    --bg:#0b0b0b;
-    --panel:#111;
-    --muted:#bfbfbf;
-    --gold:#d4af37;
+:root {
+    --bg: #0b0b0b;
+    --panel: #111;
+    --muted: #bfbfbf;
+    --gold: #d4af37;
     --glass: rgba(255,255,255,0.03);
     --accent: linear-gradient(90deg,#d4af37,#ffd57a);
+    --red: #ff4d4d; /* Added for server messages */
     font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
 }
 *{box-sizing:border-box}
