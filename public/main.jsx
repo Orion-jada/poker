@@ -22,7 +22,7 @@ function useSocket(url, onMessage) {
     return { send };
 }
 
-function App(){
+function App() {
     const [name, setName] = useState('');
     const [joined, setJoined] = useState(false);
     const [players, setPlayers] = useState([]);
@@ -41,6 +41,7 @@ function App(){
     const [SB, setSB] = useState(10);
     const [BB, setBB] = useState(20);
     const [bettingStarted, setBettingStarted] = useState(false);
+    const [chatInput, setChatInput] = useState(''); // New state for chat input
 
     const { send } = useSocket((location.origin.replace(/^http/, 'ws')) + '/ws', (msg) => {
         if (msg.type === 'joined') {
@@ -68,17 +69,26 @@ function App(){
             }
         } else if (msg.type === 'kicked') {
             appendChat('You have been kicked by admin');
-            setTimeout(()=>window.location.reload(), 1500);
+            setTimeout(() => window.location.reload(), 1500);
         } else if (msg.type === 'error') {
             appendChat('Error: ' + (msg.message || 'unknown'));
         } else if (msg.type === 'showdown_result') {
-            appendChat(`Showdown winners: ${msg.winners.map(w=>w.name).join(', ')} (share: ${msg.potShare})`);
+            appendChat(`Showdown winners: ${msg.winners.map(w => w.name).join(', ')} (share: ${msg.potShare})`);
         } else if (msg.type === 'auto_fold_win') {
             appendChat(`${msg.winner.name} won ${msg.pot} when everyone else folded`);
+        } else if (msg.type === 'chat') { // New handler for chat messages
+            appendChat(`${msg.from}: ${msg.message}`);
         }
     });
 
     function appendChat(t) { setChat(c => [...c, t].slice(-80)); }
+
+    // New function to send chat messages
+    function sendChat() {
+        if (!chatInput.trim()) return;
+        send({ type: 'chat', message: chatInput });
+        setChatInput('');
+    }
 
     function join() {
         if (!name) return;
@@ -243,29 +253,24 @@ function App(){
                     <div style={{fontWeight:700,color: 'var(--gold)'}}>Controls</div>
                     <div className="small">Admin: {adminMode ? 'ON' : 'OFF'}</div>
                 </div>
-
                 <div style={{marginTop:12}}>
                     <div className="small">Players</div>
                     <div className="player-list" style={{marginTop:8}}>
                         {players.map(p => <div className="player" key={'pl'+p.id}><div className="name">{p.name}</div><div className="chips">{p.chips}</div></div>)}
                     </div>
                 </div>
-
                 <div className="center-line"></div>
-
                 <div>
                     <div className="small">Admin Panel</div>
                     <input className="input" placeholder="admin password" type="password" value={adminPass} onChange={e=>setAdminPass(e.target.value)} />
                     <div style={{display:'flex',gap:8,marginTop:8}}>
                         <button className="btn" onClick={adminAuth}>Unlock</button>
-                        {/* Admin controls only visible when authenticated */}
                         {adminMode && <>
                             <button className="btn gold" onClick={()=>adminCmd('start_round')}>Start Round</button>
                             <button className="btn" onClick={()=>adminCmd('advance')}>Advance Phase</button>
                             <button className="btn" onClick={()=>adminCmd('reset_all')}>Reset All</button>
                         </>}
                     </div>
-
                     {adminMode && (
                         <div style={{marginTop:8}}>
                             <div className="small">Admin Actions</div>
@@ -282,16 +287,23 @@ function App(){
                         </div>
                     )}
                 </div>
-
                 <div className="center-line"></div>
-
                 <div>
-                    <div className="small">Logs</div>
+                    <div className="small">Chat & Logs</div>
                     <div style={{height:220,overflow:'auto',background:'rgba(255,255,255,0.02)',padding:8,borderRadius:8,marginTop:8}}>
-                        {chat.map((c,i)=><div key={i} style={{fontSize:13}}>{c}</div>)}
+                        {chat.map((c,i)=><div key={i} style={{fontSize:13, color: c.includes(':') ? 'var(--muted)' : 'var(--red)'}}>{c}</div>)}
+                    </div>
+                    <div style={{marginTop:12, display:'flex', gap:8}}>
+                        <input
+                            className="input"
+                            placeholder="Type a message..."
+                            value={chatInput}
+                            onChange={e => setChatInput(e.target.value)}
+                            onKeyDown={e => { if (e.key === 'Enter') sendChat(); }}
+                        />
+                        <button className="btn gold" onClick={sendChat}>Send</button>
                     </div>
                 </div>
-
             </div>
         </div>
     );

@@ -478,29 +478,25 @@ wss.on('connection', (ws) => {
       const msg = JSON.parse(data.toString());
       if (msg.type === 'join') {
         const name = (msg.name || 'Player').slice(0,20);
-        const seat = players.length + 1; // seats start at 1
+        const seat = players.length + 1;
         const player = { id, name, chips: 1000, ws, folded: false, hole: [], seat, currentBet: 0, active: true };
         players.push(player);
         attachedPlayer = player;
         sendTo(ws, { type: 'joined', player: { id: player.id, name: player.name, chips: player.chips, seat } });
         broadcastState();
       }
-
       else if (msg.type === 'admin_auth') {
         const ok = msg.pass === ADMIN_PASS;
         sendTo(ws, { type: 'admin_auth_result', ok });
         if (ok) ws.isAdmin = true;
       }
-
       else if (msg.type === 'admin_cmd') {
         if (!ws.isAdmin) return sendTo(ws, { type: 'error', message: 'not admin' });
         const cmd = msg.cmd;
         if (cmd === 'start_round') {
-          // ensure dealerIndex valid
           if (players.length < 2) return sendTo(ws, { type: 'error', message: 'Need at least 2 players' });
           startNewRound();
         } else if (cmd === 'advance') {
-          // admin override to advance
           advancePhase();
         } else if (cmd === 'reset_all') {
           players.forEach(p => { p.chips = 1000; p.hole = []; p.folded = false; p.currentBet = 0; p.active = true; });
@@ -518,7 +514,17 @@ wss.on('connection', (ws) => {
           broadcastState();
         }
       }
-
+      else if (msg.type === 'chat') { // New chat message handler
+        const player = players.find(p => p.id === id);
+        if (!player) return sendTo(ws, { type: 'error', message: 'Not joined' });
+        const message = (msg.message || '').trim().slice(0, 200); // Limit length to prevent spam
+        if (!message) return;
+        broadcast({
+          type: 'chat',
+          from: player.name,
+          message
+        });
+      }
       else if (msg.type === 'action') {
         // server enforces turns
         // actions: fold, check, call, bet(amount), allin
@@ -650,9 +656,7 @@ wss.on('connection', (ws) => {
           advancePhase();
           return;
         }
-
       }
-
     } catch (e) {
       console.error('ws parse error', e);
       sendTo(ws, { type: 'error', message: 'bad message' });

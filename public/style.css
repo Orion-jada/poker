@@ -46,6 +46,7 @@ html,body,#root{height:100%;margin:0;background:var(--bg);color:var(--muted)}
 .me{margin-top:12px;padding:10px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:10px}
 .center-line{height:1px;background:rgba(255,255,255,0.03);margin:12px 0}
 .input{width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:var(--muted)}
+.right .input{flex: 1;}
 .footer{font-size:12px;color:#777;margin-top:10px}
 .badge{background:rgba(0,0,0,0.4);padding:6px 8px;border-radius:999px;border:1px solid rgba(255,255,255,0.03)}
 .controls-row{display:flex;gap:8px;align-items:center}
