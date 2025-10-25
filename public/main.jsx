@@ -42,6 +42,7 @@ function App() {
     const [BB, setBB] = useState(20);
     const [bettingStarted, setBettingStarted] = useState(false);
     const [chatInput, setChatInput] = useState(''); // New state for chat input
+    const [allHands, setAllHands] = useState([]);
 
     const { send } = useSocket((location.origin.replace(/^http/, 'ws')) + '/ws', (msg) => {
         if (msg.type === 'joined') {
@@ -74,6 +75,7 @@ function App() {
             appendChat('Error: ' + (msg.message || 'unknown'));
         } else if (msg.type === 'showdown_result') {
             appendChat(`Showdown winners: ${msg.winners.map(w => w.name).join(', ')} (share: ${msg.potShare})`);
+            setAllHands(msg.allHands || []);
         } else if (msg.type === 'auto_fold_win') {
             appendChat(`${msg.winner.name} won ${msg.pot} when everyone else folded`);
         } else if (msg.type === 'chat') { // New handler for chat messages
@@ -177,7 +179,6 @@ function App() {
 
                             <div style={{display:'flex',gap:12,flexWrap:'wrap'}}>
                                 {players.map((p, idx) => {
-                                    // Determine role labels
                                     let role = '';
                                     if (idx === dealerIndex) role = 'Dealer';
                                     else if (idx === (dealerIndex + 1) % players.length) role = 'Small Blind';
@@ -189,7 +190,7 @@ function App() {
                                         else if (idx === (utgIndex + 2) % players.length) role = 'MP';
                                         else if (idx === (utgIndex + 3) % players.length) role = 'BTN';
                                     }
-
+                                    const hand = phase === 'showdown' && allHands.find(h => h.id === p.id);
                                     return (
                                         <div
                                             key={p.id}
@@ -208,6 +209,13 @@ function App() {
                                                 </div>
                                                 <div className="chips">Chips: {p.chips}</div>
                                                 <div className="small">Bet: {p.currentBet}</div>
+                                                {hand && (
+                                                    <div style={{display:'flex',gap:8,marginTop:4}}>
+                                                        <div className="card">{renderCard(hand.hole[0])}</div>
+                                                        <div className="card">{renderCard(hand.hole[1])}</div>
+                                                        {hand.folded && <div className="small" style={{color:'var(--red)'}}>(Folded)</div>}
+                                                    </div>
+                                                )}
                                             </div>
                                             <div style={{ textAlign: 'right' }}>
                                                 <div className="small">{p.folded ? 'Folded' : (idx === turnIndex ? 'Turn' : '')}</div>
@@ -284,6 +292,21 @@ function App() {
                                     if(sel) adminCmd('kick', { playerId: sel });
                                 }}>Kick</button>
                             </div>
+                            <div style={{marginTop:8}}>
+                                <div className="small">Manage Chips</div>
+                                <div style={{display:'flex',gap:8,marginTop:6}}>
+                                    <select id="chipSelect" className="input" style={{width:'100%'}}>
+                                        <option value="">Select player</option>
+                                        {players.map(p => <option key={p.id} value={p.id}>{p.name} ({p.chips} chips)</option>)}
+                                    </select>
+                                    <input id="chipAmount" className="input" type="number" placeholder="Amount" style={{width:100}} />
+                                    <button className="btn gold" onClick={()=>{
+                                        const sel = document.getElementById('chipSelect').value;
+                                        const amt = parseInt(document.getElementById('chipAmount').value);
+                                        if (sel && !isNaN(amt) && amt !== 0) adminCmd('adjust_chips', { playerId: sel, amount: amt });
+                                    }}>Add/Remove</button>
+                                </div>
+                            </div>
                         </div>
                     )}
                 </div>
@@ -310,12 +333,8 @@ function App() {
 }
 
 function renderCard(c) {
-    if (!c) return '??';
-    // card like "As" -> render with suit symbol
-    const rank = c.slice(0, -1);
-    const s = c.slice(-1);
-    const suitMap = {s:'♠',h:'♥',d:'♦',c:'♣'};
-    return `${rank}${suitMap[s] || s}`;
+    if (!c) return <div className="card-placeholder">?</div>;
+    return <img src={`/cards/${c}.png`} alt={c} className="card-image" />;
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
