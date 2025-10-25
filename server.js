@@ -415,52 +415,52 @@ function evaluateHand7(cards7) {
 }
 
 function performShowdown() {
-    const results = players
-        .filter(p => !p.folded && p.hole.length === 2)
-        .map(p => ({ player: p, score: evaluateHand([...p.hole, ...community]) }));
-    if (results.length === 0) {
-        phase = 'lobby';
-        dealerIndex = (dealerIndex + 1) % players.length;
-        broadcastState();
-        return;
-    }
-    let best = results[0];
-    for (const r of results) {
-        let winner = r;
-        const a = r.score, b = best.score;
-        for (let i=0; i<Math.max(a.length, b.length); i++) {
-            const av = a[i] || 0;
-            const bv = b[i] || 0;
-            if (av > bv) { winner = r; break; }
-            if (av < bv) { winner = best; break; }
-        }
-        if (winner === r) best = r;
-    }
-    const winners = results.filter(r => {
-        if (r.score.rank !== best.score.rank) return false;
-        const a = r.score.tiebreak, b = best.score.tiebreak;
-        if (a.length !== b.length) return false;
-        for (let i=0; i<a.length; i++) if (a[i] !== b[i]) return false;
-        return true;
-    });
-    const share = Math.floor(pot / winners.length);
-    winners.forEach(w => w.player.chips += share);
-    pot = 0;
+  const results = players
+    .filter(p => !p.folded && p.hole.length === 2)
+    .map(p => ({ player: p, score: evaluateHand([...p.hole, ...community]) }));
+  if (results.length === 0) {
     phase = 'lobby';
     dealerIndex = (dealerIndex + 1) % players.length;
-    broadcast({
-        type: 'showdown_result',
-        winners: winners.map(w => ({ id: w.player.id, name: w.player.name })),
-        community,
-        potShare: share,
-        allHands: players.map(p => ({
-            id: p.id,
-            name: p.name,
-            hole: p.hole,
-            folded: p.folded
-        }))
-    });
     broadcastState();
+    return;
+  }
+  let best = results[0];
+  for (const r of results) {
+    let winner = r;
+    const a = r.score, b = best.score;
+    for (let i=0; i<Math.max(a.length, b.length); i++) {
+      const av = a[i] || 0;
+      const bv = b[i] || 0;
+      if (av > bv) { winner = r; break; }
+      if (av < bv) { winner = best; break; }
+    }
+    if (winner === r) best = r;
+  }
+  const winners = results.filter(r => {
+    if (r.score.rank !== best.score.rank) return false;
+    const a = r.score.tiebreak, b = best.score.tiebreak;
+    if (a.length !== b.length) return false;
+    for (let i=0; i<a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  });
+  const share = Math.floor(pot / winners.length);
+  winners.forEach(w => w.player.chips += share);
+  pot = 0;
+  phase = 'lobby';
+  dealerIndex = (dealerIndex + 1) % players.length;
+  broadcast({
+    type: 'showdown_result',
+    winners: winners.map(w => ({ id: w.player.id, name: w.player.name })),
+    community,
+    potShare: share,
+    allHands: players.map(p => ({
+      id: p.id,
+      name: p.name,
+      hole: p.hole,
+      folded: p.folded
+    }))
+  });
+  broadcastState();
 }
 
 wss.on('connection', (ws) => {
@@ -489,34 +489,34 @@ wss.on('connection', (ws) => {
         const cmd = msg.cmd;
         if (cmd === 'start_round') {
           if (players.length < 2) return sendTo(ws, { type: 'error', message: 'Need at least 2 players' });
-            startNewRound();
+          startNewRound();
         } else if (cmd === 'advance') {
-            advancePhase();
+          advancePhase();
         } else if (cmd === 'reset_all') {
-            players.forEach(p => { p.chips = 1000; p.hole = []; p.folded = false; p.currentBet = 0; p.active = true; });
-            pot = 0; community = []; phase = 'lobby';
-            broadcastState();
+          players.forEach(p => { p.chips = 1000; p.hole = []; p.folded = false; p.currentBet = 0; p.active = true; });
+          pot = 0; community = []; phase = 'lobby';
+          broadcastState();
         } else if (cmd === 'kick') {
-            const pid = msg.playerId;
-            players = players.filter(p => {
-                if (p.id === pid) {
-                    if (p.ws && p.ws.readyState === WebSocket.OPEN) sendTo(p.ws, { type: 'kicked' });
-                    return false;
-                }
-                return true;
-            });
-            broadcastState();
+          const pid = msg.playerId;
+          players = players.filter(p => {
+            if (p.id === pid) {
+              if (p.ws && p.ws.readyState === WebSocket.OPEN) sendTo(p.ws, { type: 'kicked' });
+              return false;
+            }
+            return true;
+          });
+          broadcastState();
         } else if (cmd === 'adjust_chips') {
-            const pid = msg.playerId;
-            const amount = parseInt(msg.amount);
-            if (!pid || isNaN(amount) || amount === 0) return sendTo(ws, { type: 'error', message: 'Invalid player or amount' });
-            const player = players.find(p => p.id === pid);
-            if (!player) return sendTo(ws, { type: 'error', message: 'Player not found' });
-            const newChips = Math.max(0, player.chips + amount); // Prevent negative chips
-            player.chips = newChips;
-            player.active = newChips > 0;
-            broadcast({ type: 'chat', message: `Admin adjusted ${player.name}'s chips by ${amount > 0 ? '+' : ''}${amount} to ${newChips}` });
-            broadcastState();
+          const pid = msg.playerId;
+          const amount = parseInt(msg.amount);
+          if (!pid || isNaN(amount) || amount === 0) return sendTo(ws, { type: 'error', message: 'Invalid player or amount' });
+          const player = players.find(p => p.id === pid);
+          if (!player) return sendTo(ws, { type: 'error', message: 'Player not found' });
+          const newChips = Math.max(0, player.chips + amount); // Prevent negative chips
+          player.chips = newChips;
+          player.active = newChips > 0;
+          broadcast({ type: 'chat', message: `Admin adjusted ${player.name}'s chips by ${amount > 0 ? '+' : ''}${amount} to ${newChips}` });
+          broadcastState();
         }
       }
       else if (msg.type === 'chat') { // New chat message handler

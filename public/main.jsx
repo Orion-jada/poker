@@ -334,7 +334,7 @@ function App() {
 
 function renderCard(c) {
     if (!c) return <div className="card-placeholder">?</div>;
-    return <img src={`/cards/${c}.png`} alt={c} className="card-image" />;
+    return <img src={`/cards/${c}.jpg`} alt={c} className="card-image" />;
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
