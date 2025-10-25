@@ -4,7 +4,7 @@
     --panel: #111;
     --muted: #bfbfbf;
     --gold: #d4af37;
-    --glass: rgba(255,255,255,0.03);
+    --glass: rgba(255, 0, 0, 0.03);
     --accent: linear-gradient(90deg,#d4af37,#ffd57a);
     --red: #ff4d4d; /* Added for server messages */
     font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
@@ -32,13 +32,25 @@ html,body,#root{height:100%;margin:0;background:var(--bg);color:var(--muted)}
 .small{font-size:13px;color:#999}
 .lobby, .table, .admin{margin-top:12px}
 .player-list{display:flex;flex-wrap:wrap;gap:8px}
-.player{padding:8px 10px;background:var(--glass);border-radius:10px;min-width:140px;display:flex;justify-content:space-between;align-items:center}
+.player {
+    padding: 8px 10px;
+    background: var(--glass);
+    border-radius: 10px;
+    min-width: 140px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center
+}
+.player.turn {
+    border: 1px solid var(--red); /* Red border for other players' turn */
+}
+.player.turn.self {
+    border: 1px solid var(--gold); /* Yellow (gold) border for client's own turn */
+}
 .player .name{font-weight:600;color:#fff}
 .player .chips{font-size:13px;color:var(--muted)}
 .controls{display:flex;gap:8px;margin-top:12px}
-.btn{
-    background:transparent;border:1px solid rgba(255,255,255,0.06);padding:8px 10px;border-radius:10px;color:var(--muted);cursor:pointer;
-}
+.btn{background:transparent;border:1px solid rgba(255,255,255,0.06);padding:8px 10px;border-radius:10px;color:var(--muted);cursor:pointer;}
 .btn.gold{border-color:var(--gold);color:var(--gold);font-weight:600}
 .btn.small{padding:6px 8px;font-size:13px;border-radius:8px}
 .table-view{background:linear-gradient(180deg,#0d0d0d,#0a0a0a);border-radius:12px;padding:18px;color:#fff;display:flex;flex-direction:column;gap:12px}

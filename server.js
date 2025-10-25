@@ -32,10 +32,124 @@ let lastAggressorIndex = null; // index of last player to raise / bet
 let checkCounter = 0;      // increments on checks/calls; reset on bet/raise/allin
 let requiredChecks = 0;    // number of active players required to "check" to close the round
 
+/* Poker hand evaluation utilities */
+const rankValues = {
+  '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
+  '10': 10, 'J': 11, 'Q': 12, 'K': 13, 'A': 14
+};
+
+function parseCard(card) {
+  const rank = card.slice(0, -1);
+  const suit = card.slice(-1);
+  return { rank: rankValues[rank], suit };
+}
+
+function getCombinations(arr, k, start = 0, curr = [], res = []) {
+  if (curr.length === k) {
+    res.push([...curr]);
+    return res;
+  }
+  for (let i = start; i < arr.length; i++) {
+    curr.push(arr[i]);
+    getCombinations(arr, k, i + 1, curr, res);
+    curr.pop();
+  }
+  return res;
+}
+
+function countRanks(ranks) {
+  const c = {};
+  ranks.forEach(r => c[r] = (c[r] || 0) + 1);
+  return c;
+}
+
+function checkStraight(ranks) {
+  const unique = [...new Set(ranks)].sort((a, b) => a - b);
+  if (unique.length < 5) return false;
+  if (unique[4] - unique[0] === 4) return true;
+  // wheel straight
+  if (unique.includes(14) && unique.includes(2) && unique.includes(3) && unique.includes(4) && unique.includes(5)) return true;
+  return false;
+}
+
+function getHandValue(cards) {
+  let ranks = cards.map(c => c.rank).sort((a, b) => b - a);
+  const isFlush = cards.every(c => c.suit === cards[0].suit);
+  const isStraight = checkStraight(ranks);
+  const rankCounts = countRanks(ranks);
+  // Sort ranks by count desc, then rank desc
+  const countValues = Object.entries(rankCounts)
+    .sort((a, b) => b[1] - a[1] || b[0] - a[0])
+    .map(e => +e[0]);
+  const counts = Object.values(rankCounts).sort((a, b) => b - a);
+
+  let type = 0;
+  let tiebreakers = ranks; // default for high card, flush
+
+  if (counts[0] === 4) {
+    type = 7; // quads
+    tiebreakers = [countValues[0], countValues[1]];
+  } else if (counts[0] === 3 && counts[1] === 2) {
+    type = 6; // full house
+    tiebreakers = [countValues[0], countValues[1]];
+  } else if (counts[0] === 3) {
+    type = 3; // trips
+    tiebreakers = [countValues[0], countValues[1], countValues[2]];
+  } else if (counts[0] === 2 && counts[1] === 2) {
+    type = 2; // two pair
+    tiebreakers = [countValues[0], countValues[1], countValues[2]];
+  } else if (counts[0] === 2) {
+    type = 1; // pair
+    tiebreakers = [countValues[0], countValues[1], countValues[2], countValues[3]];
+  } else {
+    type = 0; // high card
+  }
+
+  if (isFlush) {
+    type = isStraight ? 8 : 5; // straight flush or flush
+  } else if (isStraight) {
+    type = 4; // straight
+  }
+
+  if (isStraight || (isFlush && isStraight)) {
+    let high = ranks[0];
+    if (ranks[0] === 14 && ranks[4] === 2) high = 5;
+    tiebreakers = [high];
+  } else if (isFlush) {
+    tiebreakers = ranks;
+  }
+
+  return { type, tiebreakers };
+}
+
+function compareHandValues(v1, v2) {
+  if (v1.type > v2.type) return 1;
+  if (v1.type < v2.type) return -1;
+  const maxLen = Math.max(v1.tiebreakers.length, v2.tiebreakers.length);
+  for (let i = 0; i < maxLen; i++) {
+    const r1 = v1.tiebreakers[i] || 0;
+    const r2 = v2.tiebreakers[i] || 0;
+    if (r1 > r2) return 1;
+    if (r1 < r2) return -1;
+  }
+  return 0;
+}
+
+function evaluatePlayerHand(p) {
+  const seven = [...p.hole, ...community].map(parseCard);
+  const combos = getCombinations(seven, 5);
+  let best = { type: 0, tiebreakers: [] };
+  for (const combo of combos) {
+    const val = getHandValue(combo);
+    if (compareHandValues(val, best) > 0) best = val;
+  }
+  return best;
+}
+
 /* Utilities */
 function makeDeck() {
-  const suits = ['s','h','d','c']; // use letters internally
-  const ranks = ['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
+  const suits = ['s', 'h', 'd', 'c']; // use letters internally
+  const ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
   const d = [];
   for (const s of suits) for (const r of ranks) d.push(r + s);
   return d;
@@ -98,10 +212,38 @@ function resetPlayerRoundState() {
   });
 }
 function compactPlayers() {
-  // remove disconnected players that have no ws
+  // remove disconnected players that have no ws and no chips
   players = players.filter(p => !(p.ws === null && p.chips === 0));
 }
+function advanceIfUnable() {
+  let loops = 0;
+  while (loops < players.length * 2) { // safety limit
+    if (players.length === 0) break;
+    const actor = players[turnIndex];
+    if (!actor) break;
+    if (actor.ws && actor.ws.readyState === WebSocket.OPEN && !actor.folded && actor.chips > 0) {
+      break; // able to act
+    } else {
+      if (actor.ws === null || actor.ws.readyState !== WebSocket.OPEN) {
+        // disconnected, auto-fold if not already folded
+        if (!actor.folded) {
+          actor.folded = true;
+          broadcast({ type: 'chat', message: `${actor.name} disconnected, auto-folding` });
+        }
+      } else if (actor.chips === 0 && !actor.folded) {
+        // all-in, auto-pass (count as check/call)
+        checkCounter++;
+      }
+      // advance turn (skips folded or zero chips automatically via nextActiveIndex)
+      turnIndex = nextActiveIndex(turnIndex);
+    }
+    loops++;
+  }
+}
 function broadcastState() {
+  if (phase !== 'lobby') {
+    advanceIfUnable(); // auto-advance if current turn cannot act
+  }
   broadcast({
     type: 'state',
     players: publicPlayerInfo(),
@@ -205,9 +347,9 @@ function postBlind(idx, amt) {
 function nextActiveIndex(fromIdx) {
   if (players.length === 0) return 0;
   let i = (fromIdx + 1) % players.length;
-  for (let tries=0; tries<players.length; tries++) {
+  for (let tries = 0; tries < players.length; tries++) {
     if (players[i] && players[i].chips > 0) return i;
-    i = (i+1) % players.length;
+    i = (i + 1) % players.length;
   }
   // fallback
   return (fromIdx + 1) % players.length;
@@ -253,248 +395,99 @@ function advancePhase() {
 }
 
 function isBettingRoundComplete() {
-  const inPlayers = players.filter(p => !p.folded && (p.chips > 0 || p.currentBet > 0));
-  if (inPlayers.length <= 1) return true;
-
-  // If everyone has matched currentBet or is all-in
-  const allMatched = inPlayers.every(p => p.currentBet === currentBet || p.chips === 0);
-  if (!allMatched) return false;
-
-  // Only advance if turnIndex is back to last aggressor
-  if (lastAggressorIndex === null) {
-    // No one bet/raised: check if full loop done
-    return true;
-  } else {
-    return turnIndex === nextActiveIndex(lastAggressorIndex);
-  }
-}
-
-/* Hand evaluation: returns comparable score where higher is better.
-   We'll implement a compact evaluator for: straight flush, quads, full house, flush, straight, trips, two pair, pair, high card.
-   Score format: [rank(8..0), tiebreaker ranks...]
-*/
-function rankToValue(r) {
-  if (r === 'A') return 14;
-  if (r === 'K') return 13;
-  if (r === 'Q') return 12;
-  if (r === 'J') return 11;
-  return parseInt(r, 10);
-}
-function parseCard(card) {
-  // card like 'As' or '10h' etc.
-  const suit = card.slice(-1);
-  const rank = card.slice(0, -1);
-  return { rank, suit, value: rankToValue(rank) };
-}
-function getAllCombos(arr, k) {
-  const res = [];
-  const n = arr.length;
-  function backtrack(start, comb) {
-    if (comb.length === k) {
-      res.push(comb.slice());
-      return;
-    }
-    for (let i = start; i < n; i++) {
-      comb.push(arr[i]);
-      backtrack(i+1, comb);
-      comb.pop();
-    }
-  }
-  backtrack(0, []);
-  return res;
-}
-function evaluate5(cards) {
-  // cards: array of 5 strings
-  const parsed = cards.map(parseCard).sort((a,b)=>b.value - a.value);
-  const values = parsed.map(p => p.value);
-  const suits = parsed.map(p => p.suit);
-
-  const counts = {};
-  for (const v of values) counts[v] = (counts[v]||0) + 1;
-  const countsArr = Object.entries(counts).map(([v,c])=>({v: parseInt(v,10), c})).sort((a,b) => b.c - a.c || b.v - a.v);
-
-  const isFlush = suits.every(s => s === suits[0]);
-
-  // Straight detection (consider wheel A-2-3-4-5)
-  let uniqueVals = [...new Set(values)].sort((a,b)=>b-a);
-  // handle wheel possibility by adding 1 for A as value 1
-  let isStraight = false;
-  let topStraightValue = 0;
-  if (uniqueVals.length >= 5) {
-    for (let i = 0; i <= uniqueVals.length - 5; i++) {
-      const window = uniqueVals.slice(i, i+5);
-      if (window[0] - window[4] === 4) {
-        isStraight = true;
-        topStraightValue = window[0];
-        break;
-      }
-    }
-  }
-  // wheel: A(14),5,4,3,2
-  if (!isStraight) {
-    const hasA = uniqueVals.includes(14);
-    const has5432 = [5,4,3,2].every(v=>uniqueVals.includes(v));
-    if (hasA && has5432) { isStraight = true; topStraightValue = 5; }
-  }
-
-  // Straight flush
-  if (isFlush && isStraight) {
-    return {rank:8, tiebreak: [topStraightValue]};
-  }
-
-  // Four of a kind
-  if (countsArr[0].c === 4) {
-    const four = countsArr[0].v;
-    const kicker = countsArr.find(x=>x.v !== four).v;
-    return {rank:7, tiebreak: [four,kicker]};
-  }
-
-  // Full house
-  if (countsArr[0].c === 3 && countsArr.length >1 && countsArr[1].c >=2) {
-    const triple = countsArr[0].v;
-    const pair = countsArr[1].v;
-    return {rank:6, tiebreak:[triple,pair]};
-  }
-
-  // Flush
-  if (isFlush) {
-    return {rank:5, tiebreak: values};
-  }
-
-  // Straight
-  if (isStraight) {
-    return {rank:4, tiebreak:[topStraightValue]};
-  }
-
-  // Three of a kind
-  if (countsArr[0].c === 3) {
-    const triple = countsArr[0].v;
-    const kickers = countsArr.slice(1).map(x=>x.v).slice(0,2);
-    return {rank:3, tiebreak:[triple,...kickers]};
-  }
-
-  // Two pair
-  if (countsArr[0].c === 2 && countsArr[1] && countsArr[1].c === 2) {
-    const hi = countsArr[0].v;
-    const lo = countsArr[1].v;
-    const kicker = countsArr.slice(2).find(x=>x).v;
-    return {rank:2, tiebreak:[hi,lo,kicker]};
-  }
-
-  // One pair
-  if (countsArr[0].c === 2) {
-    const pair = countsArr[0].v;
-    const kickers = countsArr.slice(1).map(x=>x.v).slice(0,3);
-    return {rank:1, tiebreak:[pair,...kickers]};
-  }
-
-  // High card
-  return {rank:0, tiebreak: values.slice(0,5)};
-}
-function evaluateHand7(cards7) {
-  // cards7: array of 7 card strings
-  const combos = getAllCombos(cards7, 5);
-  let best = null;
-  for (const c of combos) {
-    const eval5 = evaluate5(c);
-    if (!best) { best = eval5; continue; }
-    if (eval5.rank > best.rank) best = eval5;
-    else if (eval5.rank === best.rank) {
-      // compare tiebreakers lexicographically
-      const a = eval5.tiebreak;
-      const b = best.tiebreak;
-      for (let i=0;i<Math.max(a.length,b.length);i++) {
-        const av = a[i] || 0;
-        const bv = b[i] || 0;
-        if (av > bv) { best = eval5; break; }
-        if (av < bv) break;
-      }
-    }
-  }
-  return best;
+  const inPlayers = players.filter(p => !p.folded && (p.chips > 0 || p.currentBet > 0)).length;
+  return requiredChecks > 0 && checkCounter >= requiredChecks;
 }
 
 function performShowdown() {
-  const results = players
-    .filter(p => !p.folded && p.hole.length === 2)
-    .map(p => ({ player: p, score: evaluateHand([...p.hole, ...community]) }));
-  if (results.length === 0) {
-    phase = 'lobby';
-    dealerIndex = (dealerIndex + 1) % players.length;
-    broadcastState();
-    return;
-  }
-  let best = results[0];
-  for (const r of results) {
-    let winner = r;
-    const a = r.score, b = best.score;
-    for (let i=0; i<Math.max(a.length, b.length); i++) {
-      const av = a[i] || 0;
-      const bv = b[i] || 0;
-      if (av > bv) { winner = r; break; }
-      if (av < bv) { winner = best; break; }
+  // reveal all hands for non-folded players
+  const participants = players.filter(p => !p.folded);
+
+  if (participants.length === 0) return;
+
+  const allHands = participants.map(p => ({ id: p.id, name: p.name, hole: p.hole }));
+
+  // evaluate hands
+  participants.forEach(p => p.bestValue = evaluatePlayerHand(p));
+
+  // find winners
+  let maxValue = { type: 0, tiebreakers: [] };
+  participants.forEach(p => {
+    if (compareHandValues(p.bestValue, maxValue) > 0) {
+      maxValue = p.bestValue;
     }
-    if (winner === r) best = r;
-  }
-  const winners = results.filter(r => {
-    if (r.score.rank !== best.score.rank) return false;
-    const a = r.score.tiebreak, b = best.score.tiebreak;
-    if (a.length !== b.length) return false;
-    for (let i=0; i<a.length; i++) if (a[i] !== b[i]) return false;
-    return true;
   });
-  const share = Math.floor(pot / winners.length);
-  winners.forEach(w => w.player.chips += share);
+
+  const winners = participants.filter(p => compareHandValues(p.bestValue, maxValue) === 0);
+
+  const potShare = Math.floor(pot / winners.length);
+  winners.forEach(w => w.chips += potShare);
   pot = 0;
-  phase = 'lobby';
-  dealerIndex = (dealerIndex + 1) % players.length;
+
   broadcast({
     type: 'showdown_result',
-    winners: winners.map(w => ({ id: w.player.id, name: w.player.name })),
-    community,
-    potShare: share,
-    allHands: players.map(p => ({
-      id: p.id,
-      name: p.name,
-      hole: p.hole,
-      folded: p.folded
-    }))
+    winners: winners.map(w => ({ id: w.id, name: w.name })),
+    potShare,
+    allHands
   });
-  broadcastState();
+
+  // after short delay, start new round or back to lobby
+  setTimeout(() => {
+    startNewRound();
+  }, 5000);
 }
 
+/* WebSocket handling */
+let idCounter = 0;
 wss.on('connection', (ws) => {
-  const id = Math.random().toString(36).slice(2,9);
-  let attachedPlayer = null;
+  let id = null;
+  let isAdmin = false;
 
   ws.on('message', (data) => {
     try {
-      const msg = JSON.parse(data.toString());
+      const msg = JSON.parse(data);
+
       if (msg.type === 'join') {
-        const name = (msg.name || 'Player').slice(0,20);
-        const seat = players.length + 1;
-        const player = { id, name, chips: 1000, ws, folded: false, hole: [], seat, currentBet: 0, active: true };
-        players.push(player);
-        attachedPlayer = player;
-        sendTo(ws, { type: 'joined', player: { id: player.id, name: player.name, chips: player.chips, seat } });
+        const existing = players.find(p => p.name === msg.name && p.ws === null);
+        if (existing) {
+          existing.ws = ws;
+          id = existing.id;
+          sendTo(ws, { type: 'joined', player: { id, name: existing.name, chips: existing.chips } });
+          broadcastState();
+          return;
+        }
+        id = Date.now() + idCounter++;
+        players.push({
+          id,
+          name: msg.name,
+          chips: 1000,
+          ws,
+          folded: false,
+          hole: [],
+          seat: players.length + 1,
+          currentBet: 0,
+          active: true
+        });
+        sendTo(ws, { type: 'joined', player: { id, name: msg.name, chips: 1000 } });
         broadcastState();
-      }
-      else if (msg.type === 'admin_auth') {
-        const ok = msg.pass === ADMIN_PASS;
-        sendTo(ws, { type: 'admin_auth_result', ok });
-        if (ok) ws.isAdmin = true;
-      }
-      else if (msg.type === 'admin_cmd') {
-        if (!ws.isAdmin) return sendTo(ws, { type: 'error', message: 'not admin' });
+      } else if (msg.type === 'admin_auth') {
+        if (msg.pass === ADMIN_PASS) {
+          isAdmin = true;
+          sendTo(ws, { type: 'admin_auth_result', ok: true });
+        } else {
+          sendTo(ws, { type: 'admin_auth_result', ok: false });
+        }
+      } else if (msg.type === 'admin_cmd') {
+        if (!isAdmin) return sendTo(ws, { type: 'error', message: 'Not admin' });
         const cmd = msg.cmd;
         if (cmd === 'start_round') {
-          if (players.length < 2) return sendTo(ws, { type: 'error', message: 'Need at least 2 players' });
           startNewRound();
         } else if (cmd === 'advance') {
-          advancePhase();
+          if (phase !== 'lobby' && phase !== 'showdown') advancePhase();
         } else if (cmd === 'reset_all') {
-          players.forEach(p => { p.chips = 1000; p.hole = []; p.folded = false; p.currentBet = 0; p.active = true; });
-          pot = 0; community = []; phase = 'lobby';
+          players.forEach(p => p.chips = 1000);
+          pot = 0;
+          community = []; phase = 'lobby';
           broadcastState();
         } else if (cmd === 'kick') {
           const pid = msg.playerId;
@@ -637,20 +630,6 @@ wss.on('connection', (ws) => {
           return;
         }
 
-        // If only one player remains (everyone else folded), award pot immediately
-        if (allButOneFolded()) {
-          const winner = players.find(p => !p.folded);
-          if (winner) {
-            winner.chips += pot;
-            broadcast({ type: 'auto_fold_win', winner: { id: winner.id, name: winner.name }, pot });
-            pot = 0;
-          }
-          phase = 'lobby';
-          dealerIndex = (dealerIndex + 1) % players.length;
-          broadcastState();
-          return;
-        }
-
         // Recompute requiredChecks in case some players folded or went all-in
         requiredChecks = players.filter(p => !p.folded && (p.chips > 0 || p.currentBet > 0)).length;
 
@@ -672,8 +651,8 @@ wss.on('connection', (ws) => {
     // detach player's ws but keep player in list (so their chips persist)
     const p = players.find(p => p.id === id);
     if (p) p.ws = null;
-    players = players.filter(p => p.id !== id || p.ws !== null); // remove disconnected players
-    broadcastState();
+    if (phase === 'lobby') compactPlayers();
+    broadcastState(); // this will trigger advanceIfUnable if needed
   });
 });
 

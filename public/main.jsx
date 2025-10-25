@@ -194,13 +194,7 @@ function App() {
                                     return (
                                         <div
                                             key={p.id}
-                                            className="player"
-                                            style={{
-                                                minWidth: 160,
-                                                border: idx === turnIndex
-                                                    ? `1px solid ${idx === meIndex ? 'var(--gold)' : 'rgba(255,255,255,0.08)'}`
-                                                    : 'none'
-                                            }}
+                                            className={`player ${idx === turnIndex ? 'turn' : ''} ${idx === turnIndex && idx === meIndex ? 'self' : ''}`}
                                         >
                                             <div>
                                                 <div className="name">
