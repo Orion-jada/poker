@@ -1,4 +1,1 @@
-1. kicking players doesn't work
-2. add the bots and ai assist
-3. the give money button does not work, it gives "error: player not found" even when the player is actually in the lobby and playing
-4. when people are out of money, it still deals them cards and counts them as playing
+1. add the bots and ai assist
