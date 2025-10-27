@@ -171,10 +171,23 @@ function broadcast(obj) {
 function sendTo(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
+
+/* Helper: determine "active" (eligible for dealing/acting) based on chips */
+/* 
+  isPlayerActiveForNewRound: used when starting a new round to decide who gets dealt cards / who is eligible for blinds.
+  active-for-round checks used elsewhere (showdown, all-but-one-folded) must also include players who are all-in (currentBet > 0).
+*/
+function isPlayerActiveForNewRound(p) {
+  return !!p && (p.chips > 0);
+}
+
+/* publicPlayerInfo: show roles relative to dealer.
+   We'll use nextActiveIndex which by default will include currentBet players (all-ins) for role positioning.
+*/
 function publicPlayerInfo() {
-  // Determine SB and BB relative to dealer
+  // Determine SB and BB relative to dealer using robust nextActiveIndex
   const sbIndex = nextActiveIndex(dealerIndex);
-  const bbIndex = nextActiveIndex(sbIndex);
+  const bbIndex = sbIndex !== -1 ? nextActiveIndex(sbIndex) : -1;
 
   return players.map((p, idx) => {
     let role = '';
@@ -184,8 +197,7 @@ function publicPlayerInfo() {
     else if (idx === bbIndex) role = 'Big Blind';
     else {
       // Figure out if they’re UTG or other position
-      // UTG = next active after BB
-      const utgIndex = nextActiveIndex(bbIndex);
+      const utgIndex = bbIndex !== -1 ? nextActiveIndex(bbIndex) : -1;
       if (idx === utgIndex) role = 'UTG';
       else role = 'Player';
     }
@@ -197,7 +209,7 @@ function publicPlayerInfo() {
       folded: p.folded,
       seat: p.seat,
       currentBet: p.currentBet || 0,
-      active: p.active !== false,
+      active: p.chips > 0,
       role
     };
   });
@@ -215,12 +227,35 @@ function compactPlayers() {
   // remove disconnected players that have no ws and no chips
   players = players.filter(p => !(p.ws === null && p.chips === 0));
 }
+
+/* nextActiveIndex: find next player index after fromIdx that is "active"
+   - by default (chipsOnly = false): return players that are either have chips > 0 OR have currentBet > 0 (i.e., in-pot / all-in participants are counted)
+   - if chipsOnly = true: only return players with chips > 0 (used when deciding who can act or who should be dealt cards)
+   returns -1 if none found.
+*/
+function nextActiveIndex(fromIdx, chipsOnly = false) {
+  if (players.length === 0) return -1;
+  let i = ((fromIdx + 1) % players.length + players.length) % players.length;
+  for (let tries = 0; tries < players.length; tries++) {
+    const p = players[i];
+    if (!p) { i = (i + 1) % players.length; continue; }
+    if (chipsOnly) {
+      if (p.chips > 0) return i;
+    } else {
+      if (p.chips > 0 || (p.currentBet && p.currentBet > 0)) return i;
+    }
+    i = (i + 1) % players.length;
+  }
+  return -1;
+}
+
 function advanceIfUnable() {
   let loops = 0;
   while (loops < players.length * 2) { // safety limit
     if (players.length === 0) break;
     const actor = players[turnIndex];
     if (!actor) break;
+    // actor must be connected, not folded, and have chips to be able to act
     if (actor.ws && actor.ws.readyState === WebSocket.OPEN && !actor.folded && actor.chips > 0) {
       break; // able to act
     } else {
@@ -231,15 +266,18 @@ function advanceIfUnable() {
           broadcast({ type: 'chat', message: `${actor.name} disconnected, auto-folding` });
         }
       } else if (actor.chips === 0 && !actor.folded) {
-        // all-in, auto-pass (count as check/call)
+        // all-in / out of chips, auto-pass (count as check/call)
         checkCounter++;
       }
-      // advance turn (skips folded or zero chips automatically via nextActiveIndex)
-      turnIndex = nextActiveIndex(turnIndex);
+      // advance turn to next player who actually has chips (only those with chips can be asked to act)
+      const next = nextActiveIndex(turnIndex, true);
+      if (next === -1) break;
+      turnIndex = next;
     }
     loops++;
   }
 }
+
 function broadcastState() {
   if (phase !== 'lobby') {
     advanceIfUnable(); // auto-advance if current turn cannot act
@@ -262,10 +300,18 @@ function broadcastState() {
 
 /* Poker core helpers */
 function dealHoleCards() {
+  // Deal only to players with chips > 0, in seat order starting after dealer.
+  const activePlayersInOrder = [];
+  for (let j = 0; j < players.length; j++) {
+    const p = players[(dealerIndex + 1 + j) % players.length];
+    if (isPlayerActiveForNewRound(p)) activePlayersInOrder.push(p);
+  }
+  // ensure hole arrays exist
+  activePlayersInOrder.forEach(p => { if (!p.hole) p.hole = []; });
+
   for (let i = 0; i < 2; i++) {
-    for (let j = 0; j < players.length; j++) {
-      const p = players[(dealerIndex + 1 + j) % players.length];
-      if (p && p.active) p.hole.push(deck.pop());
+    for (const p of activePlayersInOrder) {
+      p.hole.push(deck.pop());
     }
   }
 }
@@ -289,7 +335,7 @@ function startNewRound() {
   checkCounter = 0;
   requiredChecks = 0;
 
-  // ensure at least two active players with chips
+  // ensure at least two active players with chips (only players with chips are eligible for new rounds)
   const activeCount = players.filter(p => p.chips > 0).length;
   if (activeCount < 2) {
     broadcast({ type: 'error', message: 'Need at least 2 players with chips to start round' });
@@ -298,25 +344,37 @@ function startNewRound() {
     return;
   }
 
-  // deal hole cards
+  // deal hole cards only to players with chips
   dealHoleCards();
 
-  // find small blind and big blind (next active players after dealer)
-  const sbIndex = nextActiveIndex(dealerIndex);
-  const bbIndex = nextActiveIndex(sbIndex);
+  // find small blind and big blind (next active players after dealer); require chips > 0 for blinds
+  const sbIndex = nextActiveIndex(dealerIndex, true);
+  const bbIndex = (sbIndex !== -1) ? nextActiveIndex(sbIndex, true) : -1;
 
   // reset bets
   players.forEach(p => p.currentBet = 0);
 
-  // post blinds
-  postBlind(sbIndex, SB);
-  postBlind(bbIndex, BB);
+  // post blinds (only if found valid indices)
+  if (sbIndex !== -1) postBlind(sbIndex, SB);
+  if (bbIndex !== -1) postBlind(bbIndex, BB);
 
-  currentBet = Math.max(SB, BB, players[bbIndex].currentBet); // ensure currentBet reflects BB (or larger if BB was all-in)
-  // action starts on player after big blind (UTG)
-  turnIndex = nextActiveIndex(bbIndex);
+  currentBet = Math.max(SB, BB, ...players.map(p => p.currentBet || 0)); // ensure currentBet reflects BB or larger
+  // action starts on player after big blind (UTG). If bbIndex invalid, pick first active after dealer
+  let firstToAct = (bbIndex !== -1) ? nextActiveIndex(bbIndex, true) : nextActiveIndex(dealerIndex, true);
+  if (firstToAct === -1) {
+    // Fallback: find any active player index (chips > 0)
+    firstToAct = players.findIndex(p => p.chips > 0);
+    if (firstToAct === -1) {
+      // shouldn't happen because activeCount >= 2 checked earlier, but guard anyway
+      phase = 'lobby';
+      broadcast({ type: 'error', message: 'No active players to start round' });
+      broadcastState();
+      return;
+    }
+  }
+  turnIndex = firstToAct;
 
-  // Setup check-counter semantics for phase closing: only count active players (not folded, not all-in)
+  // Setup check-counter semantics for phase closing: only count active players (not folded, not all-in-only)
   requiredChecks = players.filter(p => !p.folded && (p.chips > 0 || p.currentBet > 0)).length;
   checkCounter = 0;
 
@@ -328,7 +386,8 @@ function startNewRound() {
 
   // send private hole cards
   players.forEach(p => {
-    if (p.hole && p.hole.length === 2) {
+    // only send to players who were dealt cards (chips > 0 and hole length === 2)
+    if (p.hole && p.hole.length === 2 && p.ws) {
       sendTo(p.ws, { type: 'your_hole', hole: p.hole, roundId });
     }
   });
@@ -336,23 +395,12 @@ function startNewRound() {
 
 function postBlind(idx, amt) {
   const p = players[idx];
-  if (!p || !p.active) return;
+  if (!p || p.chips <= 0) return;
   const pay = Math.min(amt, p.chips);
   p.chips -= pay;
   p.currentBet = (p.currentBet || 0) + pay;
   pot += pay;
   if (p.chips === 0) p.active = false;
-}
-
-function nextActiveIndex(fromIdx) {
-  if (players.length === 0) return 0;
-  let i = (fromIdx + 1) % players.length;
-  for (let tries = 0; tries < players.length; tries++) {
-    if (players[i] && players[i].chips > 0) return i;
-    i = (i + 1) % players.length;
-  }
-  // fallback
-  return (fromIdx + 1) % players.length;
 }
 
 function allButOneFolded() {
@@ -390,7 +438,8 @@ function advancePhase() {
   bettingRoundStarted = true;
 
   // set turn to first active player after dealer (standard: first to act postflop is player left of dealer)
-  turnIndex = nextActiveIndex(dealerIndex);
+  const first = nextActiveIndex(dealerIndex, true); // choose players who actually have chips to act
+  if (first !== -1) turnIndex = first;
   broadcastState();
 }
 
@@ -400,8 +449,8 @@ function isBettingRoundComplete() {
 }
 
 function performShowdown() {
-  // reveal all hands for non-folded players
-  const participants = players.filter(p => !p.folded);
+  // reveal all hands for non-folded players who have hole cards (include all-in players)
+  const participants = players.filter(p => !p.folded && (p.hole && p.hole.length >= 2));
 
   if (participants.length === 0) return;
 
@@ -490,19 +539,23 @@ wss.on('connection', (ws) => {
           community = []; phase = 'lobby';
           broadcastState();
         } else if (cmd === 'kick') {
-          const pid = msg.playerId;
-          players = players.filter(p => {
-            if (p.id === pid) {
-              if (p.ws && p.ws.readyState === WebSocket.OPEN) sendTo(p.ws, { type: 'kicked' });
-              return false;
-            }
-            return true;
-          });
+          // Ensure numeric id matching and proper removal
+          const pid = Number(msg.playerId);
+          if (isNaN(pid)) return sendTo(ws, { type: 'error', message: 'Invalid player id' });
+          const toKick = players.find(p => p.id === pid);
+          if (!toKick) return sendTo(ws, { type: 'error', message: 'Player not found' });
+          // notify and close connection if open
+          if (toKick.ws && toKick.ws.readyState === WebSocket.OPEN) {
+            try { sendTo(toKick.ws, { type: 'kicked' }); } catch (e) {}
+            try { toKick.ws.close(); } catch (e) {}
+          }
+          players = players.filter(p => p.id !== pid);
+          broadcast({ type: 'chat', message: `Admin kicked ${toKick.name}` });
           broadcastState();
         } else if (cmd === 'adjust_chips') {
-          const pid = msg.playerId;
-          const amount = parseInt(msg.amount);
-          if (!pid || isNaN(amount) || amount === 0) return sendTo(ws, { type: 'error', message: 'Invalid player or amount' });
+          const pid = Number(msg.playerId);
+          const amount = parseInt(msg.amount, 10);
+          if (isNaN(pid) || isNaN(amount)) return sendTo(ws, { type: 'error', message: 'Invalid player or amount' });
           const player = players.find(p => p.id === pid);
           if (!player) return sendTo(ws, { type: 'error', message: 'Player not found' });
           const newChips = Math.max(0, player.chips + amount); // Prevent negative chips
@@ -537,8 +590,9 @@ wss.on('connection', (ws) => {
           return sendTo(ws, { type: 'error', message: 'Not your turn' });
         }
         if (actor.folded || actor.chips === 0) {
-          // advance turn automatically
-          turnIndex = nextActiveIndex(turnIndex);
+          // advance turn automatically to next player with chips > 0
+          const next = nextActiveIndex(turnIndex, true);
+          if (next !== -1) turnIndex = next;
           broadcastState();
           return;
         }
@@ -604,14 +658,9 @@ wss.on('connection', (ws) => {
           return sendTo(ws, { type: 'error', message: 'unknown action' });
         }
 
-        // advance turn to next active (non-folded) player
-        let tries = 0;
-        do {
-          turnIndex = (turnIndex + 1) % players.length;
-          tries++;
-          // if we loop too much, break
-          if (tries > players.length + 5) break;
-        } while ((players[turnIndex].folded || players[turnIndex].chips === 0) && tries < players.length + 5);
+        // advance turn to next active (non-folded) player who has chips (only players with chips can act)
+        const next = nextActiveIndex(turnIndex, true);
+        if (next !== -1) turnIndex = next;
 
         broadcastState();
 
