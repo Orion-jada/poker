@@ -1,0 +1,4 @@
+1. kicking players doesn't work
+2. there should be an options for whether cards should be rendered as symbols or images. Also, add a hide cards checkbutton that hides a player's hole cards.
+3. the give money button does not work, it gives "error: player not found" even when the player is actually in the lobby and playing
+4. when people are out of money, it still deals them cards and counts them as playing
