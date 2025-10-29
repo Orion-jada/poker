@@ -15,6 +15,8 @@ import math
 import random
 import time
 from typing import List, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 
 RANKS = "23456789TJQKA"
 SUITS = "cdhs"
@@ -76,7 +78,7 @@ def best_five_from_seven(cards: List[str]) -> Tuple[int, Tuple]:
     assert 5 <= len(cards) <= 7
     # Group by suit, by rank
     suits = {s: [] for s in SUITS}
-    rank_counts = [0] * 13
+    rank_counts = np.zeros(13, dtype=int)  # Use NumPy for faster counting
     for c in cards:
         r = card_to_rank(c)
         rank_counts[r] += 1
@@ -173,29 +175,38 @@ def compare_hands(a: Tuple[int, Tuple], b: Tuple[int, Tuple]) -> int:
 # -----------------------------
 # Equity Simulation (Monte Carlo) with caching
 # -----------------------------
-@lru_cache(maxsize=2048)
-def cached_equity_query(hole: Tuple[str, ...], community: Tuple[str, ...], num_opponents: int, sims: int=1000) -> float:
+@lru_cache(maxsize=4096)  # Increased cache size
+def cached_equity_query(hole: Tuple[str, ...], community: Tuple[str, ...], num_opponents: int, stage: str, sims: int=1000) -> float:
     """
-    Cache key limited to avoid explosion. This wrapper just calls simulate_equity_core.
-    Note: caching by tuple of cards is effective if same queries repeat.
+    Cache key expanded to include stage for better hits.
     """
-    return simulate_equity_core(list(hole), list(community), num_opponents, sims)
+    return simulate_equity_core(list(hole), list(community), num_opponents, stage, sims)
 
-def simulate_equity(hero_cards: List[str], community_cards: List[str], num_opponents: int=1, sims: int=1000, deterministic: bool=False) -> float:
+def simulate_equity(hero_cards: List[str], community_cards: List[str], num_opponents: int=1, stage: str="flop", sims: int=1000, deterministic: bool=False) -> float:
     """
     Public function. Uses cached queries when possible.
     hero_cards, community_cards: lists of strings
     deterministic: if True, iterate through combinations (slow for many unknowns) but deterministic.
     """
     # Normalizing tuple keys for cache
-    key = (tuple(sorted(hero_cards)), tuple(sorted(community_cards)), num_opponents, sims)
+    key = (tuple(sorted(hero_cards)), tuple(sorted(community_cards)), num_opponents, stage, sims)
     try:
-        return cached_equity_query(key[0], key[1], num_opponents, sims)
+        return cached_equity_query(key[0], key[1], num_opponents, stage, sims)
     except Exception:
         # fallback
-        return simulate_equity_core(hero_cards, community_cards, num_opponents, sims, deterministic)
+        return simulate_equity_core(hero_cards, community_cards, num_opponents, stage, sims, deterministic)
 
-def simulate_equity_core(hero_cards: List[str], community_cards: List[str], num_opponents: int=1, sims: int=1000, deterministic: bool=False) -> float:
+def single_sim(hero_cards, community_cards, num_opponents, deck, remaining_board_slots):
+    draw = random.sample(deck, remaining_board_slots + 2 * num_opponents)
+    opp_hands = [draw[i*2:(i+1)*2] for i in range(num_opponents)]
+    board = community_cards + draw[2*num_opponents:]
+    hero_score = best_five_from_seven(hero_cards + board)
+    opp_scores = [best_five_from_seven(h + board) for h in opp_hands]
+    best_opp = max(opp_scores, key=lambda s: (s[0], s[1]))
+    cmp = compare_hands(hero_score, best_opp)
+    return 1 if cmp > 0 else 0.5 if cmp == 0 else 0
+
+def simulate_equity_core(hero_cards: List[str], community_cards: List[str], num_opponents: int=1, stage: str="flop", sims: int=1000, deterministic: bool=False) -> float:
     """
     Monte Carlo simulation: return win probability (ties counted as half).
     Optimizations:
@@ -207,12 +218,21 @@ def simulate_equity_core(hero_cards: List[str], community_cards: List[str], num_
     remaining_board_slots = 5 - len(community_cards)
     hero_cards_local = list(hero_cards)
 
+    # Adjust sims dynamically based on stage
+    if stage == "flop":
+        sims = 2000
+    elif stage == "turn":
+        sims = 1500
+    else:  # river
+        sims = 1000
+    sims = min(sims, 5000 // (num_opponents + 1))  # Scale down for multiway
+
     # trivial cases
     if remaining_board_slots == 0 and num_opponents == 0:
         # showdown with no opponents
         return 1.0
 
-    wins, ties = 0, 0
+    wins_plus_half_ties = 0
     total = sims
 
     # if deterministic and combinatorially small, iterate combos
@@ -228,34 +248,25 @@ def simulate_equity_core(hero_cards: List[str], community_cards: List[str], num_
             best_opp = max(opp_scores, key=lambda s: (s[0], s[1]))
             cmp = compare_hands(hero_score, best_opp)
             if cmp > 0:
-                wins += 1
+                wins_plus_half_ties += 1
             elif cmp == 0:
-                ties += 1
+                wins_plus_half_ties += 0.5
         total = max(1, max_comb)
-        return (wins + 0.5 * ties) / total
+        return wins_plus_half_ties / total
 
-    # Monte Carlo random sampling
-    for _ in range(sims):
-        draw = random.sample(deck, remaining_board_slots + 2 * num_opponents)
-        opp_hands = [draw[i*2:(i+1)*2] for i in range(num_opponents)]
-        board = community_cards + draw[2*num_opponents:]
-        hero_score = best_five_from_seven(hero_cards_local + board)
-        opp_scores = [best_five_from_seven(h + board) for h in opp_hands]
-        # find the best opponent score (max by category then tiebreaker)
-        best_opp = max(opp_scores, key=lambda s: (s[0], s[1]))
-        cmp = compare_hands(hero_score, best_opp)
-        if cmp > 0:
-            wins += 1
-        elif cmp == 0:
-            ties += 1
+    # Monte Carlo random sampling with parallelization
+    args = [(hero_cards_local, community_cards, num_opponents, deck, remaining_board_slots) for _ in range(sims)]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda a: single_sim(*a), args))
+    wins_plus_half_ties = sum(results)
 
-    return (wins + 0.5 * ties) / total
+    return wins_plus_half_ties / total
 
 # -----------------------------
 # Opponent Model
 # -----------------------------
 class OpponentModel:
-    def __init__(self, history_len: int = 200):
+    def __init__(self, history_len: int = 200, decay_factor: float = 0.95):
         self.stats = defaultdict(lambda: {
             "hands_seen": 0,
             "vpip": 0,  # voluntary put money in pot
@@ -267,13 +278,21 @@ class OpponentModel:
             "cbets": 0,
             "fold_to_cbet": 0,
             "showdowns": 0,
+            "three_bet": 0,
+            "wtsd": 0,
+            "pos_aggression": defaultdict(float),
             "recent_actions": deque(maxlen=history_len),
             "stack_samples": deque(maxlen=history_len),
             "positions": defaultdict(int),
         })
+        self.decay_factor = decay_factor
 
-    def observe_action(self, pid: str, stage: str, action: str, position: str = "mp", stack: float = None):
+    def observe_action(self, pid: str, stage: str, action: str, position: str = "mp", stack: float = None, previous_action: str = None):
         s = self.stats[pid]
+        # Apply decay to existing stats before update
+        for key in ["vpip", "pfr", "bets", "raises", "calls", "folds", "cbets", "fold_to_cbet", "showdowns", "three_bet", "wtsd"]:
+            s[key] *= self.decay_factor
+
         s["recent_actions"].append((stage, action, position))
         if stack is not None:
             s["stack_samples"].append(stack)
@@ -285,6 +304,8 @@ class OpponentModel:
                 s["hands_seen"] += 1
             if action == "raise":
                 s["pfr"] += 1
+                if previous_action == "raise":
+                    s["three_bet"] += 1
         if action == "bet":
             s["bets"] += 1
         elif action == "raise":
@@ -294,6 +315,10 @@ class OpponentModel:
         elif action == "fold":
             s["folds"] += 1
 
+        # Update position aggression
+        aggression_score = 1 if action in ("bet", "raise") else 0 if action == "call" else -1 if action == "fold" else 0
+        s["pos_aggression"][position] = (s["pos_aggression"][position] * s["positions"][position] + aggression_score) / (s["positions"][position] + 1)
+
     def record_cbet(self, pid: str, did_cbet: bool):
         if did_cbet:
             self.stats[pid]["cbets"] += 1
@@ -302,8 +327,10 @@ class OpponentModel:
         if folded:
             self.stats[pid]["fold_to_cbet"] += 1
 
-    def record_showdown(self, pid: str):
+    def record_showdown(self, pid: str, won: bool = False):
         self.stats[pid]["showdowns"] += 1
+        if won:
+            self.stats[pid]["wtsd"] += 1
 
     def get_profile(self, pid: str) -> Dict[str, float]:
         s = self.stats[pid]
@@ -314,6 +341,8 @@ class OpponentModel:
         cbets = s["cbets"] / hands
         fold_to_cbet = s["fold_to_cbet"] / max(1, s["cbets"])
         showdown = s["showdowns"] / hands
+        three_bet = s["three_bet"] / hands
+        wtsd = s["wtsd"] / max(1, s["showdowns"])
         avg_stack = (sum(s["stack_samples"]) / len(s["stack_samples"])) if s["stack_samples"] else 0
         pos_dist = {k: v / sum(s["positions"].values()) if s["positions"] else 0 for k, v in s["positions"].items()}
         return {
@@ -323,6 +352,8 @@ class OpponentModel:
             "CBet%": cbets,
             "FoldToCbet%": fold_to_cbet,
             "Showdown%": showdown,
+            "ThreeBet%": three_bet,
+            "WTSD%": wtsd,
             "AvgStack": avg_stack,
             "PosDist": pos_dist,
             "HandsSeen": hands
@@ -395,6 +426,25 @@ def chen_score(hole_cards: List[str]) -> float:
     return score
 
 # -----------------------------
+# Board Texture Analysis
+# -----------------------------
+def analyze_board(community: List[str]) -> str:
+    """
+    Analyze board texture: 'dry' (few draws), 'wet' (many draws/flush/straight possible).
+    """
+    suits_count = defaultdict(int)
+    ranks = sorted([card_to_rank(c) for c in community])
+    flush_draw = any(suits_count[s] >= 3 for s in SUITS)  # 3+ same suit
+    straight_draw = False
+    for i in range(len(ranks) - 1):
+        if ranks[i+1] - ranks[i] <= 2:  # Close ranks for draws
+            straight_draw = True
+            break
+    if flush_draw or straight_draw:
+        return "wet"
+    return "dry"
+
+# -----------------------------
 # Decision Engine (PokerAI)
 # -----------------------------
 class PokerAI:
@@ -416,6 +466,7 @@ class PokerAI:
          - players: list of pids (including hero)
          - stacks: dict pid->stacksize (effective stacks)
          - min_raise: float (optional)
+         - position: str (optional)
         Returns dict with keys: action (fold/call/raise/check/bet), size, equity, ev_call, rationale
         """
         hero = game_state["hero"]
@@ -427,16 +478,23 @@ class PokerAI:
         players = list(game_state.get("players", []))
         stacks = game_state.get("stacks", {})
         min_raise = game_state.get("min_raise", pot * 0.5 if pot > 0 else 1.0)
+        position = game_state.get("position", "mp")
         opponents = [p for p in players if p != hero]
 
         # Effective stack (min over hero and opponents)
         eff_stack = min([stacks.get(hero, float('inf'))] + [stacks.get(p, float('inf')) for p in opponents])
 
+        # Dynamic risk aversion based on stack
+        if eff_stack < 20:
+            self.risk_aversion = max(0.2, self.risk_aversion - 0.3)  # More aggressive short stack
+        elif eff_stack > 100:
+            self.risk_aversion = min(0.8, self.risk_aversion + 0.2)  # Tighter deep stack
+
         # Preflop direct heuristic
         if stage == "preflop":
             score = chen_score(hole)
             # conservative thresholds modulated by stack depth and position
-            early_position = game_state.get("position", "mp") in ("utg", "ep")
+            early_position = position in ("utg", "ep")
             # adjust for stack depth (short stacks -> more pushy)
             stack_factor = 1.0
             if eff_stack < 20:  # 20 bb
@@ -476,7 +534,10 @@ class PokerAI:
         # limit sims if many opponents
         if len(opponents) > 2:
             sims = max(300, sims // (len(opponents)))
-        eq = simulate_equity(hole, community, len(opponents), sims=sims)
+        eq = simulate_equity(hole, community, len(opponents), stage, sims=sims)
+        # Multiway adjustment: scale equity down
+        multiway_factor = 1.0 if len(opponents) <= 1 else max(0.4, 1.0 - 0.25 * (len(opponents)-1))
+        eq *= multiway_factor
         pot_odds = to_call / (pot + to_call) if to_call > 0 else 0
         ev_call = eq * (pot + to_call) - (1 - eq) * to_call
 
@@ -485,18 +546,12 @@ class PokerAI:
         if opponents:
             fe = sum(self.om.fold_probability(o, pot_odds, stage) for o in opponents) / len(opponents)
 
-        # Multiway adjustment reduces bluff success (can't rely on folds)
-        multiway_factor = 1.0 if len(opponents) <= 1 else max(0.4, 1.0 - 0.25 * (len(opponents)-1))
-
-        # Decision thresholds (tunable)
-        # If we have strong made hand -> value raise
-        # If medium equity and positive EV -> call
-        # If small equity but significant fold equity (and bluff plausible) -> bluff raise
-        # use risk_aversion to scale willingness to bluff
-
         # Estimate hand strength category quickly (using evaluator)
         cat, tieb = best_five_from_seven(hole + community)
         hand_strength = cat  # 0..8 mapping
+
+        # Board texture for bluff freq
+        board_texture = analyze_board(community)
 
         # Basic rules
         if to_call == 0:
@@ -528,13 +583,14 @@ class PokerAI:
             return {"action": "call", "size": to_call, "equity": eq, "ev_call": ev_call, "rationale": f"Call EV positive {ev_call:.2f}"}
 
         # Consider bluff raise if fold equity * pot > to_call (i.e., expected fold profit)
+        bluff_freq = 0.3 if board_texture == "dry" else 0.15
         bluff_expected = fe * pot - (1 - fe) * (pot * 0.5)  # approximate cost if called
         # scale by multiway_factor and risk aversion
         bluff_expected *= multiway_factor * (1 - self.risk_aversion)
-        if bluff_expected > to_call and random.random() < max(0.2, fe):
+        if bluff_expected > to_call and random.random() < max(0.2, bluff_freq):
             size = round(min(eff_stack, pot * (0.5 + fe)), 2)
             return {"action": "raise", "size": size, "equity": eq, "ev_call": ev_call,
-                    "rationale": f"Bluff raise: FE {fe:.2f}, bluff_expected {bluff_expected:.2f}"}
+                    "rationale": f"Bluff raise: FE {fe:.2f}, bluff_expected {bluff_expected:.2f}, texture {board_texture}"}
 
         # Default fold if negative EV and no good bluff/fold equity
         return {"action": "fold", "size": 0, "equity": eq, "ev_call": ev_call,
@@ -555,7 +611,7 @@ if __name__ == "__main__":
 
     # Example game state
     om = OpponentModel()
-    om.observe_action("villainA", "preflop", "raise", position="ep", stack=150)
+    om.observe_action("villainA", "preflop", "raise", position="ep", stack=150, previous_action="raise")
     om.observe_action("villainB", "preflop", "call", position="mp", stack=120)
     om.observe_action("villainA", "flop", "bet", position="ep")
     om.observe_action("villainB", "flop", "fold", position="mp")
@@ -581,5 +637,9 @@ if __name__ == "__main__":
         print(f"{pid} profile:", om.get_profile(pid))
 
     # Equity quick test
-    eq = simulate_equity(["Ah", "Kd"], ["7d", "8s", "2c"], num_opponents=1, sims=800)
+    eq = simulate_equity(["Ah", "Kd"], ["7d", "8s", "2c"], num_opponents=1, stage="flop", sims=800)
     print(f"\nEstimated equity (AhKd vs 1 random) on {game_state['community_cards']}: {eq:.3f}")
+
+    # Additional tests
+    print("\nBoard texture dry:", analyze_board(["7d", "8s", "2c"]))  # dry
+    print("Board texture wet:", analyze_board(["7d", "8d", "9d"]))  # wet flush draw
