@@ -17,6 +17,7 @@ import time
 from typing import List, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
+import json
 
 RANKS = "23456789TJQKA"
 SUITS = "cdhs"
@@ -433,8 +434,10 @@ def analyze_board(community: List[str]) -> str:
     Analyze board texture: 'dry' (few draws), 'wet' (many draws/flush/straight possible).
     """
     suits_count = defaultdict(int)
+    for c in community:
+        suits_count[card_to_suit(c)] += 1
     ranks = sorted([card_to_rank(c) for c in community])
-    flush_draw = any(suits_count[s] >= 3 for s in SUITS)  # 3+ same suit
+    flush_draw = any(count >= 3 for count in suits_count.values())  # 3+ same suit
     straight_draw = False
     for i in range(len(ranks) - 1):
         if ranks[i+1] - ranks[i] <= 2:  # Close ranks for draws
@@ -445,14 +448,55 @@ def analyze_board(community: List[str]) -> str:
     return "dry"
 
 # -----------------------------
+# Personalities
+# -----------------------------
+PERSONALITIES = {
+    "aggressive": {
+        "risk_aversion": 0.2,
+        "bluff_multiplier": 1.5,
+        "value_bet_multiplier": 1.2,
+        "description": "Plays aggressively, bluffs often, raises big."
+    },
+    "passive": {
+        "risk_aversion": 0.8,
+        "bluff_multiplier": 0.5,
+        "value_bet_multiplier": 0.8,
+        "description": "Plays cautiously, calls more, bluffs rarely."
+    },
+    "balanced": {
+        "risk_aversion": 0.5,
+        "bluff_multiplier": 1.0,
+        "value_bet_multiplier": 1.0,
+        "description": "Balanced play, mixes bluffs and value bets appropriately."
+    },
+    "loose": {
+        "risk_aversion": 0.3,
+        "bluff_multiplier": 1.2,
+        "value_bet_multiplier": 1.1,
+        "description": "Plays many hands, aggressive in pots."
+    },
+    "tight": {
+        "risk_aversion": 0.7,
+        "bluff_multiplier": 0.7,
+        "value_bet_multiplier": 0.9,
+        "description": "Plays few hands, but aggressively when in."
+    },
+}
+
+# -----------------------------
 # Decision Engine (PokerAI)
 # -----------------------------
 class PokerAI:
-    def __init__(self, opponent_model: OpponentModel, my_pid: str = "hero"):
+    def __init__(self, opponent_model: OpponentModel, my_pid: str = "hero", personality: str = "balanced"):
         self.om = opponent_model
         self.pid = my_pid
-        # risk aversion influences willingness to gamble
-        self.risk_aversion = 0.5  # 0 = wild, 1 = super tight
+        if personality not in PERSONALITIES:
+            raise ValueError(f"Unknown personality: {personality}. Available: {list(PERSONALITIES.keys())}")
+        pers = PERSONALITIES[personality]
+        self.risk_aversion = pers["risk_aversion"]
+        self.bluff_multiplier = pers["bluff_multiplier"]
+        self.value_bet_multiplier = pers["value_bet_multiplier"]
+        self.personality = personality
 
     def decide(self, game_state: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -484,11 +528,12 @@ class PokerAI:
         # Effective stack (min over hero and opponents)
         eff_stack = min([stacks.get(hero, float('inf'))] + [stacks.get(p, float('inf')) for p in opponents])
 
-        # Dynamic risk aversion based on stack
+        # Dynamic risk aversion based on stack (adjusted by personality)
+        base_risk = self.risk_aversion
         if eff_stack < 20:
-            self.risk_aversion = max(0.2, self.risk_aversion - 0.3)  # More aggressive short stack
+            self.risk_aversion = max(0.2, base_risk - 0.3)  # More aggressive short stack
         elif eff_stack > 100:
-            self.risk_aversion = min(0.8, self.risk_aversion + 0.2)  # Tighter deep stack
+            self.risk_aversion = min(0.8, base_risk + 0.2)  # Tighter deep stack
 
         # Preflop direct heuristic
         if stage == "preflop":
@@ -501,32 +546,32 @@ class PokerAI:
                 stack_factor = 1.2
             if score > 8 and not early_position:
                 # strong hand: raise
-                size = round(min(eff_stack, pot * 3 if pot > 0 else 2 * min_raise), 2)
-                rationale = f"Preflop strong Chen {score:.2f}, stack_factor {stack_factor:.2f}"
+                size = round(min(eff_stack, pot * 3 if pot > 0 else 2 * min_raise) * self.value_bet_multiplier, 2)
+                rationale = f"Preflop strong Chen {score:.2f}, stack_factor {stack_factor:.2f}, personality {self.personality}"
                 return {"action": "raise", "size": size, "equity": None, "ev_call": None, "rationale": rationale}
             elif score > 5:
                 # medium: call or small raise depending on to_call and pot odds
                 pot_odds = to_call / (pot + to_call) if to_call > 0 else 0
                 if to_call == 0:
-                    return {"action": "raise", "size": round(min(eff_stack, pot + min_raise), 2),
-                            "equity": None, "ev_call": None, "rationale": f"Preflop limp/raise with Chen {score:.2f}"}
+                    return {"action": "raise", "size": round(min(eff_stack, pot + min_raise) * self.value_bet_multiplier, 2),
+                            "equity": None, "ev_call": None, "rationale": f"Preflop limp/raise with Chen {score:.2f}, personality {self.personality}"}
                 # compute approximate equity vs one random (not exact)
                 est_eq = 0.5 if score > 6 else 0.35
                 ev_call = est_eq * (pot + to_call) - (1 - est_eq) * to_call
                 if ev_call > 0:
                     return {"action": "call", "size": to_call, "equity": est_eq, "ev_call": ev_call,
-                            "rationale": f"Preflop call: Chen {score:.2f}, EV {ev_call:.2f}"}
+                            "rationale": f"Preflop call: Chen {score:.2f}, EV {ev_call:.2f}, personality {self.personality}"}
                 else:
                     return {"action": "fold", "size": 0, "equity": est_eq, "ev_call": ev_call,
-                            "rationale": f"Preflop fold: Chen {score:.2f}, EV {ev_call:.2f}"}
+                            "rationale": f"Preflop fold: Chen {score:.2f}, EV {ev_call:.2f}, personality {self.personality}"}
             else:
                 # weak hand: fold unless very cheap to call / multiway limp value
                 if to_call == 0:
-                    return {"action": "call", "size": 0, "equity": None, "ev_call": None, "rationale": "Preflop limp (free)"}
+                    return {"action": "call", "size": 0, "equity": None, "ev_call": None, "rationale": f"Preflop limp (free), personality {self.personality}"}
                 pot_odds = to_call / (pot + to_call) if to_call > 0 else 0
                 if pot_odds < 0.05:
-                    return {"action": "call", "size": to_call, "equity": None, "ev_call": None, "rationale": "Cheap preflop call"}
-                return {"action": "fold", "size": 0, "equity": None, "ev_call": None, "rationale": "Preflop fold (weak hand)"}
+                    return {"action": "call", "size": to_call, "equity": None, "ev_call": None, "rationale": f"Cheap preflop call, personality {self.personality}"}
+                return {"action": "fold", "size": 0, "equity": None, "ev_call": None, "rationale": f"Preflop fold (weak hand), personality {self.personality}"}
 
         # Postflop (flop/turn/river)
         # 1) Estimate equity vs opponents (use 500-2000 sims depending on stage)
@@ -558,43 +603,78 @@ class PokerAI:
             # check or bet
             if hand_strength >= 4:  # straight or better
                 # strong: bet for value
-                size = round(min(eff_stack, pot * (0.6 + 0.4 * (hand_strength / 8.0))), 2)
-                rationale = f"Bet for value: strong made hand cat {hand_strength}, eq {eq:.2f}"
+                size = round(min(eff_stack, pot * (0.6 + 0.4 * (hand_strength / 8.0)) * self.value_bet_multiplier), 2)
+                rationale = f"Bet for value: strong made hand cat {hand_strength}, eq {eq:.2f}, personality {self.personality}"
                 return {"action": "bet", "size": size, "equity": eq, "ev_call": None, "rationale": rationale}
-            elif eq > 0.35 and random.random() < 0.4 * (1 - self.risk_aversion):
+            elif eq > 0.35 and random.random() < 0.4 * (1 - self.risk_aversion) * self.bluff_multiplier:
                 # semi-bluff with decent equity
-                size = round(min(eff_stack, pot * 0.4), 2)
+                size = round(min(eff_stack, pot * 0.4 * self.bluff_multiplier), 2)
                 return {"action": "bet", "size": size, "equity": eq,
-                        "ev_call": None, "rationale": f"Semi-bluff bet: eq {eq:.2f}, risk_aversion {self.risk_aversion}"}
+                        "ev_call": None, "rationale": f"Semi-bluff bet: eq {eq:.2f}, risk_aversion {self.risk_aversion}, personality {self.personality}"}
             else:
-                return {"action": "check", "size": 0, "equity": eq, "ev_call": None, "rationale": "Check (no to_call)"}
+                return {"action": "check", "size": 0, "equity": eq, "ev_call": None, "rationale": f"Check (no to_call), personality {self.personality}"}
 
         # There is an amount to call
         # Strong value raise if we have two pair or better and positive EV
         if hand_strength >= 2 and ev_call > 0:
             # raise for value
-            base_raise = pot * (0.6 + 0.3 * (hand_strength / 8.0))
+            base_raise = pot * (0.6 + 0.3 * (hand_strength / 8.0)) * self.value_bet_multiplier
             size = round(min(eff_stack, base_raise), 2)
-            rationale = f"Value raise: hand_strength {hand_strength}, eq {eq:.2f}, EV_call {ev_call:.2f}"
+            rationale = f"Value raise: hand_strength {hand_strength}, eq {eq:.2f}, EV_call {ev_call:.2f}, personality {self.personality}"
             return {"action": "raise", "size": size, "equity": eq, "ev_call": ev_call, "rationale": rationale}
 
         # If calling is +EV, call
         if ev_call > 0 and eq >= 0.2:
-            return {"action": "call", "size": to_call, "equity": eq, "ev_call": ev_call, "rationale": f"Call EV positive {ev_call:.2f}"}
+            return {"action": "call", "size": to_call, "equity": eq, "ev_call": ev_call, "rationale": f"Call EV positive {ev_call:.2f}, personality {self.personality}"}
 
         # Consider bluff raise if fold equity * pot > to_call (i.e., expected fold profit)
-        bluff_freq = 0.3 if board_texture == "dry" else 0.15
+        bluff_freq = (0.3 if board_texture == "dry" else 0.15) * self.bluff_multiplier
         bluff_expected = fe * pot - (1 - fe) * (pot * 0.5)  # approximate cost if called
         # scale by multiway_factor and risk aversion
         bluff_expected *= multiway_factor * (1 - self.risk_aversion)
         if bluff_expected > to_call and random.random() < max(0.2, bluff_freq):
-            size = round(min(eff_stack, pot * (0.5 + fe)), 2)
+            size = round(min(eff_stack, pot * (0.5 + fe) * self.bluff_multiplier), 2)
             return {"action": "raise", "size": size, "equity": eq, "ev_call": ev_call,
-                    "rationale": f"Bluff raise: FE {fe:.2f}, bluff_expected {bluff_expected:.2f}, texture {board_texture}"}
+                    "rationale": f"Bluff raise: FE {fe:.2f}, bluff_expected {bluff_expected:.2f}, texture {board_texture}, personality {self.personality}"}
 
         # Default fold if negative EV and no good bluff/fold equity
         return {"action": "fold", "size": 0, "equity": eq, "ev_call": ev_call,
-                "rationale": f"Fold: eq {eq:.2f}, EV {ev_call:.2f}, FE {fe:.2f}"}
+                "rationale": f"Fold: eq {eq:.2f}, EV {ev_call:.2f}, FE {fe:.2f}, personality {self.personality}"}
+
+# -----------------------------
+# Function to run the bot
+# -----------------------------
+def run_poker_bot(input_data: Any, personality: str = "balanced", mode: str = "bot", opponent_model: OpponentModel = None) -> Dict[str, Any]:
+    """
+    Importable function to run the poker bot.
+    
+    Args:
+    - input_data: Game state as dict or JSON string.
+    - personality: One of 'aggressive', 'passive', 'balanced', 'loose', 'tight'.
+    - mode: 'bot' for autonomous decision, 'assistant' for suggestion (adds extra rationale).
+    - opponent_model: Optional OpponentModel instance; creates new if None.
+    
+    Returns:
+    - Decision dict (JSON-serializable).
+    """
+    if isinstance(input_data, str):
+        game_state = json.loads(input_data)
+    elif isinstance(input_data, dict):
+        game_state = input_data
+    else:
+        raise ValueError("input_data must be dict or JSON string")
+
+    if opponent_model is None:
+        opponent_model = OpponentModel()
+
+    ai = PokerAI(opponent_model, my_pid=game_state.get("hero", "hero"), personality=personality)
+    decision = ai.decide(game_state)
+
+    if mode == "assistant":
+        # Add extra suggestion text
+        decision["suggestion"] = f"As your assistant with {personality} personality: {decision['rationale']}. Recommended action: {decision['action']} {decision.get('size', '')}."
+    
+    return decision
 
 # -----------------------------
 # Demo and quick unit test
@@ -615,7 +695,6 @@ if __name__ == "__main__":
     om.observe_action("villainB", "preflop", "call", position="mp", stack=120)
     om.observe_action("villainA", "flop", "bet", position="ep")
     om.observe_action("villainB", "flop", "fold", position="mp")
-    ai = PokerAI(om, my_pid="hero")
 
     game_state = {
         "hero": "hero",
@@ -630,9 +709,16 @@ if __name__ == "__main__":
         "min_raise": 10.0
     }
 
-    rec = ai.decide(game_state)
-    print("\n🧠 Poker AI Recommendation:")
-    print(rec)
+    # Test run_poker_bot as bot
+    rec_bot = run_poker_bot(game_state, personality="aggressive", mode="bot", opponent_model=om)
+    print("\n🧠 Poker Bot Recommendation (Aggressive):")
+    print(rec_bot)
+
+    # Test run_poker_bot as assistant
+    rec_assist = run_poker_bot(json.dumps(game_state), personality="passive", mode="assistant", opponent_model=om)
+    print("\n🧠 Poker Assistant Recommendation (Passive):")
+    print(rec_assist)
+
     for pid in ["villainA", "villainB"]:
         print(f"{pid} profile:", om.get_profile(pid))
 
